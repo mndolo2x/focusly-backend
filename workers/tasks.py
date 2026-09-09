@@ -39,7 +39,6 @@ def summarize_document_task(document_id: str, depth: str = "standard"):
     """
     try:
         doc = asyncio.run(document_service.get_document(document_id, user_id=""))
-        # If doc not found via default query, try direct lookup
         if not doc:
             from database import supabase
             res = supabase.table("documents").select("*").eq("id", document_id).execute()
@@ -50,19 +49,24 @@ def summarize_document_task(document_id: str, depth: str = "standard"):
             return {"status": "error", "message": f"Document {document_id} not found."}
 
         text = doc.get("extracted_text", "")
-
-        # 2. Chunk text & 3/4. Generate embeddings and store in FAISS index
         asyncio.run(rag_engine.index_document_chunks(document_id, text))
-
-        # 5. Query Ollama for structured summary and 6. Store in summaries table
         summary_record = asyncio.run(summary_service.generate_summary_for_text(document_id, text, depth=depth))
-
-        # 7. Update document status
         asyncio.run(document_service.update_document(document_id, {"status": "completed"}))
 
         return {"status": "success", "document_id": document_id, "summary_id": summary_record.get("id")}
     except Exception as e:
         asyncio.run(document_service.update_document(document_id, {"status": "failed"}))
+        return {"status": "error", "message": str(e)}
+
+@celery_app.task(name="workers.tasks.generate_quiz_task")
+def generate_quiz_task(document_id: str, num_questions: int = 10):
+    """
+    Celery task to generate multiple-choice quiz questions from document summary sections using Ollama.
+    """
+    try:
+        questions = asyncio.run(quiz_service.generate_quiz_from_summary(document_id, num_questions=num_questions))
+        return {"status": "success", "document_id": document_id, "questions_generated": len(questions)}
+    except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @celery_app.task(name="workers.tasks.generate_video_task")

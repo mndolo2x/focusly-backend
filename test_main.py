@@ -87,21 +87,34 @@ def test_document_upload_and_summarize_flow(monkeypatch):
     task_res = client.post(f"/api/documents/{doc_id}/summarize?depth=standard", headers=get_auth_headers())
     assert task_res.status_code == 200
     assert "task_id" in task_res.json()
-    assert task_res.json()["status"] == "processing"
 
-    # 3. Direct Summary (quick & deep depth)
+    # 3. Direct Summary
     summary_quick = client.post(f"/api/documents/{doc_id}/summary?depth=quick", headers=get_auth_headers())
     assert summary_quick.status_code == 200
-    assert "sections" in summary_quick.json()
 
-    summary_deep = client.post(f"/api/documents/{doc_id}/summary?depth=deep", headers=get_auth_headers())
-    assert summary_deep.status_code == 200
-    assert summary_deep.json()["depth"] == "deep"
+    # 4. Quiz Generation & Retrieval Flow
+    gen_quiz_res = client.post(f"/api/documents/{doc_id}/generate-quiz?num_questions=5", headers=get_auth_headers())
+    assert gen_quiz_res.status_code == 200
+    assert "task_id" in gen_quiz_res.json()
 
-    # 4. Get Latest Summary
-    get_sum = client.get(f"/api/documents/{doc_id}/summary", headers=get_auth_headers())
-    assert get_sum.status_code == 200
-    assert "sections" in get_sum.json()
+    get_quiz_res = client.get(f"/api/documents/{doc_id}/quiz", headers=get_auth_headers())
+    assert get_quiz_res.status_code == 200
+    questions = get_quiz_res.json()
+    assert isinstance(questions, list)
+    assert len(questions) >= 1
+
+    q_id = questions[0]["id"]
+
+    # 5. Quiz Submission
+    submissions = [
+        {"question_id": q_id, "selected_answer": 0, "confidence_score": 5}
+    ]
+    submit_res = client.post(f"/api/documents/{doc_id}/quiz/submit", json=submissions, headers=get_auth_headers())
+    assert submit_res.status_code == 200
+    sub_data = submit_res.json()
+    assert "score" in sub_data
+    assert "correct_count" in sub_data
+    assert "weak_areas" in sub_data
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

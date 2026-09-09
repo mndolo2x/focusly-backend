@@ -27,7 +27,7 @@ from services.study_service import study_service
 from services.ollama_service import ollama_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
-from workers.tasks import process_document_task, summarize_document_task
+from workers.tasks import process_document_task, summarize_document_task, generate_quiz_task
 
 app = FastAPI(
     title="Focusly Backend API",
@@ -159,7 +159,7 @@ async def delete_document(document_id: str, user: Dict[str, Any] = Depends(get_c
 @app.post("/api/documents/{document_id}/summarize")
 async def trigger_summarize_task(
     document_id: str,
-    depth: str = Query("standard", regex="^(quick|standard|deep)$"),
+    depth: str = Query("standard", pattern="^(quick|standard|deep)$"),
     user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Triggers Celery background task to summarize document with FAISS source tracking."""
@@ -175,7 +175,6 @@ async def trigger_summarize_task(
         task = summarize_document_task.delay(document_id, depth=depth)
         task_id = task.id
     except Exception:
-        # Inline execution fallback if Celery broker offline
         task_id = str(uuid.uuid4())
         text = doc.get("extracted_text", "")
         await rag_engine.index_document_chunks(document_id, text)
@@ -204,7 +203,7 @@ async def get_latest_document_summary(
 async def create_summary(
     document_id: Optional[str] = None,
     payload: Optional[SummaryCreate] = None,
-    depth: str = Query("standard", regex="^(quick|standard|deep)$"),
+    depth: str = Query("standard", pattern="^(quick|standard|deep)$"),
     user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Generates concise or comprehensive summary directly based on depth query parameter."""
@@ -230,8 +229,59 @@ async def create_summary(
 
 # --- Quiz Endpoints ---
 
+@app.post("/api/documents/{document_id}/generate-quiz")
+async def trigger_generate_quiz(
+    document_id: str,
+    num_questions: int = Query(10, ge=1, le=30),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Triggers Celery background task to generate multiple-choice quiz from summary."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    try:
+        task = generate_quiz_task.delay(document_id, num_questions=num_questions)
+        task_id = task.id
+    except Exception:
+        task_id = str(uuid.uuid4())
+        await quiz_service.generate_quiz_from_summary(document_id, num_questions=num_questions)
+
+    return {"task_id": task_id, "document_id": document_id, "num_questions": num_questions, "status": "processing"}
+
+@app.get("/api/documents/{document_id}/quiz")
+async def get_document_quiz(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns all quiz questions for a document."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    questions = await quiz_service.get_quiz_questions(document_id)
+    return questions
+
+@app.post("/api/documents/{document_id}/quiz/submit")
+async def submit_document_quiz(
+    document_id: str,
+    submissions: List[Dict[str, Any]],
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Evaluates quiz submission array [{question_id, selected_answer, confidence_score}].
+    Returns score percentage, correct/incorrect breakdown, and identified weak areas.
+    """
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    results = await quiz_service.submit_quiz_batch(user["user_id"], document_id, submissions)
+    return results
+
+# Legacy Quiz compatibility endpoints
 @app.post("/quizzes/generate/{document_id}", response_model=List[Dict[str, Any]])
-async def generate_quiz(
+async def legacy_generate_quiz(
     document_id: str,
     count: int = 5,
     user: Dict[str, Any] = Depends(get_current_user)
@@ -240,11 +290,11 @@ async def generate_quiz(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    questions = await quiz_service.generate_quiz_questions(document_id, doc.get("extracted_text", ""), count)
+    questions = await quiz_service.generate_quiz_from_summary(document_id, num_questions=count)
     return questions
 
 @app.post("/quizzes/attempt", response_model=Dict[str, Any])
-async def submit_quiz_attempt(
+async def legacy_submit_quiz_attempt(
     attempt: QuizAttemptCreate,
     user: Dict[str, Any] = Depends(get_current_user)
 ):
