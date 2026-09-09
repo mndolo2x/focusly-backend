@@ -26,6 +26,7 @@ from services.review_service import review_service
 from services.video_service import video_service
 from services.study_service import study_service
 from services.ollama_service import ollama_service
+from services.tts_service import tts_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
 from workers.tasks import process_document_task, summarize_document_task, generate_quiz_task, daily_review_queue_task
@@ -64,6 +65,11 @@ async def health_check():
 async def ollama_health_check():
     """Health check endpoint for local Ollama LLM server status."""
     return await ollama_service.check_health()
+
+@app.get("/api/health/tts")
+async def tts_health_check():
+    """Health check endpoint for local Kokoro TTS engine status."""
+    return await tts_service.check_health()
 
 # --- Document Endpoints ---
 
