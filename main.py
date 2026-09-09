@@ -1,7 +1,7 @@
 import os
 import shutil
-from typing import Any, Dict, List
-from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, status
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from admin.routes import router as admin_router
 from auth import get_current_user, router as auth_router
@@ -24,6 +24,7 @@ from services.quiz_service import quiz_service
 from services.video_service import video_service
 from services.study_service import study_service
 from services.ollama_service import ollama_service
+from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
 from workers.tasks import process_document_task
 
@@ -64,47 +65,99 @@ async def ollama_health_check():
 
 # --- Document Endpoints ---
 
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50MB
+
+@app.post("/api/documents/upload", response_model=Dict[str, Any])
 @app.post("/documents/upload", response_model=Dict[str, Any])
 async def upload_document(
     file: UploadFile = File(...),
     user: Dict[str, Any] = Depends(get_current_user)
 ):
+    """
+    Validates PDF file, uploads to Supabase Storage, extracts text via PyMuPDF/OCR/pdfplumber,
+    stores record in database, and sets status='completed'.
+    """
     user_id = user["user_id"]
+
+    # 1. Validate File Extension / Mimetype
+    filename = file.filename or "uploaded.pdf"
+    if not (filename.lower().endswith(".pdf") or file.content_type in ["application/pdf", "octet-stream"]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file type. Only PDF documents are allowed."
+        )
+
+    # Read content to validate file size
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File size exceeds maximum allowed limit of 50MB ({len(file_bytes)} bytes)."
+        )
+
+    # 2. Upload File to Supabase Storage
+    file_url = await document_service.upload_file_to_storage(file_bytes, filename, user_id)
+
+    # Save to local temporary path for extraction processing
     upload_dir = "/tmp/focusly_uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, file.filename)
+    local_file_path = os.path.join(upload_dir, f"{user_id}_{filename}")
+    with open(local_file_path, "wb") as buffer:
+        buffer.write(file_bytes)
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # 3. Create initial document record in database with status='processing'
+    doc_record = await document_service.create_document_record(user_id, filename, file_url)
+    doc_id = doc_record["id"]
 
-    doc_record = await document_service.create_document_record(user_id, file.filename, file_path)
-
-    # Trigger async processing task (Celery task or synchronous fallback)
+    # 4. Extract Text & Page Count (PyMuPDF with page tracking -> Tesseract OCR -> pdfplumber)
     try:
-        process_document_task.delay(doc_record["id"], file_path)
-    except Exception:
-        # Fallback inline processing if Celery broker is offline
-        from utils.text_extractor import text_extractor
-        extracted_text = text_extractor.extract_text_from_file(file_path)
-        page_count = text_extractor.get_page_count(file_path)
+        extracted_text, page_count = text_extractor.extract_text_and_page_count(local_file_path)
         doc_record = await document_service.update_document(
-            doc_record["id"],
-            {"extracted_text": extracted_text, "page_count": page_count, "status": "completed"}
+            doc_id,
+            {
+                "extracted_text": extracted_text,
+                "page_count": page_count,
+                "status": "completed",
+                "file_url": file_url
+            }
         )
-        rag_engine.index_document(doc_record["id"], extracted_text)
+        rag_engine.index_document(doc_id, extracted_text)
+    except Exception as e:
+        doc_record = await document_service.update_document(doc_id, {"status": "failed"})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Document text extraction failed: {str(e)}"
+        )
 
     return doc_record
 
-@app.get("/documents", response_model=List[Dict[str, Any]])
-async def list_documents(user: Dict[str, Any] = Depends(get_current_user)):
-    return await document_service.list_documents(user["user_id"])
+@app.get("/api/documents", response_model=Dict[str, Any])
+@app.get("/documents", response_model=Dict[str, Any])
+async def list_documents(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns paginated list of user's documents."""
+    return await document_service.list_documents_paginated(user["user_id"], page=page, limit=limit)
 
+@app.get("/api/documents/{document_id}", response_model=Dict[str, Any])
 @app.get("/documents/{document_id}", response_model=Dict[str, Any])
 async def get_document(document_id: str, user: Dict[str, Any] = Depends(get_current_user)):
-    doc = await document_service.get_document(document_id, user["user_id"])
-    if not doc:
+    """Returns specific document record along with its generated summary if present."""
+    doc_with_summary = await document_service.get_document_with_summary(document_id, user["user_id"])
+    if not doc_with_summary:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    return doc
+    return doc_with_summary
+
+@app.delete("/api/documents/{document_id}")
+@app.delete("/documents/{document_id}")
+async def delete_document(document_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """Deletes document record and removes file from Supabase Storage."""
+    deleted = await document_service.delete_document(document_id, user["user_id"])
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    return {"message": "Document and associated storage file deleted successfully", "id": document_id}
 
 # --- Summary Endpoints ---
 

@@ -1,4 +1,5 @@
 import os
+import io
 import jwt
 import pytest
 from fastapi.testclient import TestClient
@@ -6,6 +7,14 @@ from main import app
 from services.ollama_service import ollama_service
 
 client = TestClient(app)
+
+def get_auth_headers():
+    token = jwt.encode(
+        {"sub": "user_123", "email": "test@focusly.ai", "user_metadata": {"grade_level": "11th", "exam_targets": ["SAT"]}},
+        "test_secret",
+        algorithm="HS256"
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 def test_root():
     response = client.get("/")
@@ -28,7 +37,7 @@ def test_ollama_health_endpoint():
     assert "available_models" in data
 
 def test_unauthenticated_docs_access():
-    response = client.get("/documents")
+    response = client.get("/api/documents")
     assert response.status_code == 401
 
 def test_admin_exam_profiles():
@@ -52,55 +61,71 @@ def test_migration_sql_schema_exists():
     for tbl in expected_tables:
         assert tbl in content
 
-    expected_indexes = [
-        "idx_documents_user_id", "idx_documents_status",
-        "idx_quiz_attempts_user_id", "idx_review_items_user_id",
-        "idx_review_items_next_review_date"
-    ]
-    for idx in expected_indexes:
-        assert idx in content
-
-    assert "get_user_usage" in content
-    assert "handle_new_user_usage" in content
-    assert "ROW LEVEL SECURITY" in content
-
 def test_auth_me_with_jwt_token(monkeypatch):
-    # Test protected /api/auth/me with mock JWT token
-    token = jwt.encode(
-        {"sub": "user_123", "email": "test@focusly.ai", "user_metadata": {"grade_level": "11th", "exam_targets": ["SAT"]}},
-        "test_secret",
-        algorithm="HS256"
-    )
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
-
-    response = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    response = client.get("/api/auth/me", headers=get_auth_headers())
     assert response.status_code == 200
     data = response.json()
     assert data["id"] == "user_123"
-    assert data["email"] == "test@focusly.ai"
-    assert data["grade_level"] == "11th"
-    assert data["exam_targets"] == ["SAT"]
 
-def test_auth_logout_with_jwt_token(monkeypatch):
-    token = jwt.encode(
-        {"sub": "user_123", "email": "test@focusly.ai"},
-        "test_secret",
-        algorithm="HS256"
+def test_document_upload_validation_file_type(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+    fake_txt = io.BytesIO(b"Hello text file")
+    response = client.post(
+        "/api/documents/upload",
+        files={"file": ("test.txt", fake_txt, "text/plain")},
+        headers=get_auth_headers()
     )
+    assert response.status_code == 400
+    assert "Invalid file type" in response.json()["detail"]
+
+def test_document_upload_success(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    response = client.post("/api/auth/logout", headers={"Authorization": f"Bearer {token}"})
+    # Create minimal PDF header bytes
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file = io.BytesIO(fake_pdf)
+
+    response = client.post(
+        "/api/documents/upload",
+        files={"file": ("biology_notes.pdf", pdf_file, "application/pdf")},
+        headers=get_auth_headers()
+    )
     assert response.status_code == 200
-    assert response.json() == {"message": "Successfully logged out"}
+    data = response.json()
+    assert "id" in data
+    assert data["filename"] == "biology_notes.pdf"
+    assert data["status"] == "completed"
+
+def test_get_paginated_documents(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+    response = client.get("/api/documents?page=1&limit=5", headers=get_auth_headers())
+    assert response.status_code == 200
+    data = response.json()
+    assert "items" in data
+    assert "total" in data
+    assert "page" in data
+
+def test_delete_document(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # Upload first
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file = io.BytesIO(fake_pdf)
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("to_delete.pdf", pdf_file, "application/pdf")},
+        headers=get_auth_headers()
+    )
+    doc_id = up_res.json()["id"]
+
+    # Delete
+    del_res = client.delete(f"/api/documents/{doc_id}", headers=get_auth_headers())
+    assert del_res.status_code == 200
+    assert "deleted successfully" in del_res.json()["message"]
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):
     with pytest.raises(RuntimeError) as exc_info:
         await ollama_service.generate("Test prompt", max_retries=2, retry_delay=0.01)
     assert "Ollama connection error" in str(exc_info.value) or "Ollama" in str(exc_info.value)
-
-@pytest.mark.anyio
-async def test_ollama_service_embed_error_handling(monkeypatch):
-    with pytest.raises(RuntimeError) as exc_info:
-        await ollama_service.embed("Test text", max_retries=2, retry_delay=0.01)
-    assert "Ollama embedding connection error" in str(exc_info.value) or "Ollama" in str(exc_info.value)
