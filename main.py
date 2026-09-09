@@ -2,7 +2,7 @@ import os
 import shutil
 import uuid
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query, status
+from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from admin.routes import router as admin_router
 from auth import get_current_user, router as auth_router
@@ -425,6 +425,32 @@ async def get_document_video_url(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not ready for this document")
 
     return {"document_id": document_id, "video_url": video_url, "status": "video_ready"}
+
+@app.get("/api/documents/{document_id}/transcript")
+async def get_document_video_transcript(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns section-by-section transcript with timestamps and page tracking for document video."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    transcript = await video_service.get_document_transcript(document_id)
+    return {"document_id": document_id, "sections": transcript}
+
+@app.get("/api/documents/{document_id}/captions")
+async def get_document_video_captions(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns WebVTT formatted caption text for document video."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    vtt_content = await video_service.generate_webvtt_captions(document_id)
+    return Response(content=vtt_content, media_type="text/vtt")
 
 # Legacy Quiz compatibility endpoints
 @app.post("/quizzes/generate/{document_id}", response_model=List[Dict[str, Any]])

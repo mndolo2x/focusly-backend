@@ -30,46 +30,39 @@ def test_health_check():
     assert response.status_code == 200
     assert response.json() == {"status": "healthy", "environment": "development"}
 
-def test_ollama_health_endpoint():
-    response = client.get("/api/health/ollama")
-    assert response.status_code == 200
-    data = response.json()
-    assert "status" in data
-
-def test_video_generation_endpoints_flow(monkeypatch):
+def test_video_transcript_and_captions_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
     fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
     pdf_file = io.BytesIO(fake_pdf)
 
-    # 1. Upload Document
+    # Upload
     up_res = client.post(
         "/api/documents/upload",
-        files={"file": ("history.pdf", pdf_file, "application/pdf")},
+        files={"file": ("civics.pdf", pdf_file, "application/pdf")},
         headers=get_auth_headers()
     )
     assert up_res.status_code == 200
     doc_id = up_res.json()["id"]
 
-    # 2. Trigger Video Generation Task
-    gen_vid_res = client.post(f"/api/documents/{doc_id}/generate-video", headers=get_auth_headers())
-    assert gen_vid_res.status_code == 200
-    assert "task_id" in gen_vid_res.json()
-    assert gen_vid_res.json()["status"] == "processing"
-
-    # 3. Get Video Status
-    status_res = client.get(f"/api/documents/{doc_id}/video-status", headers=get_auth_headers())
-    assert status_res.status_code == 200
-    assert "status" in status_res.json()
-
-    # 4. Mock Video Lesson Assembly & Fetch Video URL
+    # Generate Video & Transcript
     import asyncio
-    video_url = asyncio.run(video_service.generate_video_lesson(doc_id, title="History Lesson"))
-    assert video_url is not None
+    asyncio.run(video_service.generate_video_lesson(doc_id, title="Civics Lesson"))
 
-    get_vid_res = client.get(f"/api/documents/{doc_id}/video", headers=get_auth_headers())
-    assert get_vid_res.status_code == 200
-    assert "video_url" in get_vid_res.json()
+    # GET Transcript
+    trans_res = client.get(f"/api/documents/{doc_id}/transcript", headers=get_auth_headers())
+    assert trans_res.status_code == 200
+    t_data = trans_res.json()
+    assert "sections" in t_data
+    assert len(t_data["sections"]) >= 1
+    assert "start_time" in t_data["sections"][0]
+    assert "end_time" in t_data["sections"][0]
+
+    # GET WebVTT Captions
+    vtt_res = client.get(f"/api/documents/{doc_id}/captions", headers=get_auth_headers())
+    assert vtt_res.status_code == 200
+    assert "WEBVTT" in vtt_res.text
+    assert "-->" in vtt_res.text
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

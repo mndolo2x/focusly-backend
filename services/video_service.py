@@ -7,8 +7,11 @@ from services.summary_service import summary_service
 from services.document_service import document_service
 from utils.ffmpeg_helper import ffmpeg_helper
 
+# In-memory store for transcripts and captions (fallback / local testing)
+_in_memory_transcripts: Dict[str, List[Dict[str, Any]]] = {}
+
 class VideoService:
-    """Service for video lesson assembly from document summary sections."""
+    """Service for video lesson assembly, section transcript tracking with timestamps, and WebVTT captions."""
 
     async def check_user_video_quota(self, user_id: str) -> bool:
         """Verifies if user has remaining video generation credits (max 10/month)."""
@@ -20,15 +23,24 @@ class VideoService:
             pass
         return True
 
+    def _format_timestamp_vtt(self, seconds: float) -> str:
+        """Formats seconds into WebVTT timestamp format HH:MM:SS.mmm."""
+        hrs = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int(round((seconds - int(seconds)) * 1000))
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}.{millis:03d}"
+
     async def generate_video_lesson(
         self, document_id: str, title: Optional[str] = None, summary_sections: Optional[List[Dict[str, Any]]] = None, output_dir: str = "/tmp/videos"
     ) -> str:
         """
         1. Retrieves summary sections.
         2. Calls Kokoro TTS for narration & Pillow for 1080p white slides with page numbers.
-        3. Assembles MP4 video using FFmpeg.
-        4. Uploads MP4 to Supabase Storage 'videos' bucket.
-        5. Updates document status='video_ready' with public video URL.
+        3. Measures exact audio duration per section and builds transcript with timestamps (start_time, end_time).
+        4. Assembles MP4 video using FFmpeg.
+        5. Uploads MP4 to Supabase Storage 'videos' bucket.
+        6. Updates document status='video_ready' with public video URL.
         """
         os.makedirs(output_dir, exist_ok=True)
         video_filename = f"video_{document_id}_{uuid.uuid4().hex[:8]}.mp4"
@@ -49,6 +61,8 @@ class VideoService:
 
         slide_paths = []
         audio_paths = []
+        transcript_sections = []
+        current_time = 0.0
 
         for idx, sec in enumerate(summary_sections):
             sec_title = sec.get("title", f"Section {idx+1}")
@@ -75,13 +89,32 @@ class VideoService:
             audio_file_path = os.path.join(output_dir, f"narration_{document_id}_{idx}.mp3")
             await tts_service.generate_audio(narration_text, audio_file_path)
 
+            # Measure precise audio duration for transcript timestamping
+            duration = ffmpeg_helper.get_audio_duration(audio_file_path)
+            end_time = current_time + duration
+
+            transcript_sections.append({
+                "section_index": idx,
+                "title": sec_title,
+                "text": narration_text,
+                "start_time": round(current_time, 2),
+                "end_time": round(end_time, 2),
+                "duration": round(duration, 2),
+                "page_number": page_num,
+                "bullets": bullet_texts
+            })
+
+            current_time = end_time
+
             slide_paths.append(slide_img_path)
             audio_paths.append(audio_file_path)
+
+        _in_memory_transcripts[document_id] = transcript_sections
 
         # Assemble MP4 video
         ffmpeg_helper.assemble_video(slide_paths, audio_paths, local_video_path)
 
-        # Upload MP4 file to Supabase Storage 'videos' or 'documents' bucket
+        # Upload MP4 file to Supabase Storage
         video_url = local_video_path
         try:
             with open(local_video_path, "rb") as f:
@@ -131,5 +164,69 @@ class VideoService:
         except Exception:
             pass
         return None
+
+    async def get_document_transcript(self, document_id: str) -> List[Dict[str, Any]]:
+        """Returns section-by-section transcript with timestamps and page tracking for document video."""
+        if document_id in _in_memory_transcripts:
+            return _in_memory_transcripts[document_id]
+
+        # Generate fallback transcript if not previously stored
+        summary = await summary_service.get_latest_summary(document_id)
+        sections = summary.get("sections", []) if summary else []
+
+        fallback_transcript = []
+        curr_time = 0.0
+        for idx, sec in enumerate(sections):
+            sec_title = sec.get("title", f"Section {idx+1}")
+            bullets = sec.get("bullets", [])
+            bullet_texts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in bullets]
+            page_num = bullets[0].get("page_number", 1) if bullets and isinstance(bullets[0], dict) else 1
+            text = f"{sec_title}. " + " ".join(bullet_texts)
+            duration = max(5.0, len(text.split()) * 0.4)
+            end_time = curr_time + duration
+
+            fallback_transcript.append({
+                "section_index": idx,
+                "title": sec_title,
+                "text": text,
+                "start_time": round(curr_time, 2),
+                "end_time": round(end_time, 2),
+                "duration": round(duration, 2),
+                "page_number": page_num,
+                "bullets": bullet_texts
+            })
+            curr_time = end_time
+
+        if not fallback_transcript:
+            fallback_transcript = [{
+                "section_index": 0,
+                "title": "Lesson Summary",
+                "text": "Key concept overview.",
+                "start_time": 0.0,
+                "end_time": 5.0,
+                "duration": 5.0,
+                "page_number": 1,
+                "bullets": ["Key concept overview."]
+            }]
+
+        _in_memory_transcripts[document_id] = fallback_transcript
+        return fallback_transcript
+
+    async def generate_webvtt_captions(self, document_id: str) -> str:
+        """Formats section transcript into standard WebVTT caption string."""
+        transcript = await self.get_document_transcript(document_id)
+
+        vtt_lines = ["WEBVTT\n"]
+        for idx, sec in enumerate(transcript):
+            start_vtt = self._format_timestamp_vtt(sec.get("start_time", 0.0))
+            end_vtt = self._format_timestamp_vtt(sec.get("end_time", 5.0))
+            title = sec.get("title", "")
+            text = sec.get("text", "")
+
+            vtt_lines.append(f"{idx+1}")
+            vtt_lines.append(f"{start_vtt} --> {end_vtt}")
+            vtt_lines.append(f"[{title}] {text}\n")
+
+        return "\n".join(vtt_lines)
 
 video_service = VideoService()
