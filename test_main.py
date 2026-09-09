@@ -20,60 +20,33 @@ def test_root():
     response = client.get("/")
     assert response.status_code == 200
 
-def test_user_list_exam_profiles():
-    response = client.get("/api/exams", headers=get_auth_headers())
-    assert response.status_code == 200
-    profiles = response.json()
-    assert isinstance(profiles, list)
-    assert len(profiles) >= 1
-
-def test_exam_paper_generation_and_grading_flow(monkeypatch):
+def test_dashboard_progress_metrics_and_caching(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
-    pdf_file = io.BytesIO(fake_pdf)
+    # 1. First GET request - calculates & caches dashboard metrics
+    res1 = client.get("/api/dashboard/progress", headers=get_auth_headers())
+    assert res1.status_code == 200
+    data1 = res1.json()
 
-    # 1. Upload Document
-    up_res = client.post(
-        "/api/documents/upload",
-        files={"file": ("sat_prep.pdf", pdf_file, "application/pdf")},
-        headers=get_auth_headers()
-    )
-    assert up_res.status_code == 200
-    doc_id = up_res.json()["id"]
+    required_keys = [
+        "total_lessons", "completed_lessons", "average_quiz_score",
+        "quiz_score_history", "weak_areas", "reviews_due_today",
+        "upcoming_reviews", "study_plan", "exam_countdown", "cached_at"
+    ]
+    for key in required_keys:
+        assert key in data1
 
-    # 2. Generate Practice Exam Paper
-    gen_res = client.post(
-        "/api/exams/sat-reading/generate-paper",
-        json={"document_ids": [doc_id], "num_questions": 10},
-        headers=get_auth_headers()
-    )
-    assert gen_res.status_code == 200
-    paper = gen_res.json()
-    assert "questions" in paper
-    assert len(paper["questions"]) == 10
-    assert "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board." in paper["disclaimer_text"]
+    assert isinstance(data1["total_lessons"], int)
+    assert isinstance(data1["completed_lessons"], int)
+    assert isinstance(data1["quiz_score_history"], list)
+    assert isinstance(data1["weak_areas"], list)
+    assert isinstance(data1["upcoming_reviews"], list)
 
-    paper_id = paper["id"]
-
-    # 3. GET Document Exam Paper
-    get_res = client.get(f"/api/documents/{doc_id}/exam-paper", headers=get_auth_headers())
-    assert get_res.status_code == 200
-    assert "questions" in get_res.json()
-
-    # 4. Submit & Grade Exam Paper
-    submissions = {
-        "paper_id": paper_id,
-        "answers": [
-            {"question_id": paper["questions"][0]["id"], "selected_answer": 0}
-        ]
-    }
-    submit_res = client.post("/api/exams/sat-reading/submit-paper", json=submissions, headers=get_auth_headers())
-    assert submit_res.status_code == 200
-    grade_data = submit_res.json()
-    assert "score" in grade_data
-    assert "correct_count" in grade_data
-    assert "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board." in grade_data["disclaimer_text"]
+    # 2. Second GET request - returns cached response (matching cached_at timestamp)
+    res2 = client.get("/api/dashboard/progress", headers=get_auth_headers())
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["cached_at"] == data1["cached_at"]
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

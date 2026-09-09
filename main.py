@@ -76,6 +76,19 @@ async def tts_health_check():
     """Health check endpoint for local Kokoro TTS engine status."""
     return await tts_service.check_health()
 
+# --- Dashboard Progress Endpoint ---
+
+@app.get("/api/dashboard/progress")
+async def get_dashboard_progress(
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Returns user learning progress metrics (cached for 5 minutes):
+    total_lessons, completed_lessons, average_quiz_score, quiz_score_history,
+    weak_areas, reviews_due_today, upcoming_reviews, study_plan, exam_countdown.
+    """
+    return await study_service.get_dashboard_progress(user["user_id"])
+
 # --- Public Exam Profile Endpoints ---
 
 @app.get("/api/exams")
@@ -112,7 +125,6 @@ async def get_document_exam_paper_endpoint(
 
     paper = await study_service.get_document_exam_paper(document_id)
     if not paper:
-        # Fallback inline generation if paper not pre-generated
         paper = await study_service.generate_exam_paper(user["user_id"], "practice_exam", [document_id], num_questions=25)
 
     return paper
