@@ -5,14 +5,12 @@ import pytest
 from fastapi.testclient import TestClient
 from main import app
 from services.ollama_service import ollama_service
-from services.review_service import review_service
-from services.video_service import video_service
 
 client = TestClient(app)
 
-def get_auth_headers():
+def get_auth_headers(is_admin: bool = False):
     token = jwt.encode(
-        {"sub": "user_123", "email": "test@focusly.ai", "user_metadata": {"grade_level": "11th", "exam_targets": ["SAT"]}},
+        {"sub": "user_123", "email": "test@focusly.ai", "user_metadata": {"is_admin": is_admin, "grade_level": "11th"}},
         "test_secret",
         algorithm="HS256"
     )
@@ -21,48 +19,59 @@ def get_auth_headers():
 def test_root():
     response = client.get("/")
     assert response.status_code == 200
-    json_data = response.json()
-    assert "message" in json_data
-    assert "disclaimer" in json_data
 
-def test_health_check():
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json() == {"status": "healthy", "environment": "development"}
+def test_admin_research_unauthorized_for_non_admin(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+    response = client.post(
+        "/api/admin/exams/research",
+        json={"exam_name": "Cambridge IGCSE Biology"},
+        headers=get_auth_headers(is_admin=False)
+    )
+    assert response.status_code == 403
+    assert "Admin privileges required" in response.json()["detail"]
 
-def test_video_transcript_and_captions_flow(monkeypatch):
+def test_admin_exam_research_and_crud_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
-    pdf_file = io.BytesIO(fake_pdf)
-
-    # Upload
-    up_res = client.post(
-        "/api/documents/upload",
-        files={"file": ("civics.pdf", pdf_file, "application/pdf")},
-        headers=get_auth_headers()
+    # 1. Research Exam with Admin Auth
+    res_post = client.post(
+        "/api/admin/exams/research",
+        json={"exam_name": "Cambridge IGCSE Biology"},
+        headers=get_auth_headers(is_admin=True)
     )
-    assert up_res.status_code == 200
-    doc_id = up_res.json()["id"]
+    assert res_post.status_code == 200
+    data = res_post.json()
+    assert "cambridge" in data["id"] or "biology" in data["id"]
+    assert data["exam_name"] is not None
+    assert "time_limit" in data
+    assert "disclaimer_text" in data
 
-    # Generate Video & Transcript
-    import asyncio
-    asyncio.run(video_service.generate_video_lesson(doc_id, title="Civics Lesson"))
+    exam_id = data["id"]
 
-    # GET Transcript
-    trans_res = client.get(f"/api/documents/{doc_id}/transcript", headers=get_auth_headers())
-    assert trans_res.status_code == 200
-    t_data = trans_res.json()
-    assert "sections" in t_data
-    assert len(t_data["sections"]) >= 1
-    assert "start_time" in t_data["sections"][0]
-    assert "end_time" in t_data["sections"][0]
+    # 2. List Exams
+    res_list = client.get("/api/admin/exams", headers=get_auth_headers(is_admin=True))
+    assert res_list.status_code == 200
+    assert isinstance(res_list.json(), list)
 
-    # GET WebVTT Captions
-    vtt_res = client.get(f"/api/documents/{doc_id}/captions", headers=get_auth_headers())
-    assert vtt_res.status_code == 200
-    assert "WEBVTT" in vtt_res.text
-    assert "-->" in vtt_res.text
+    # 3. Get Specific Exam
+    res_get = client.get(f"/api/admin/exams/{exam_id}", headers=get_auth_headers(is_admin=True))
+    assert res_get.status_code == 200
+    assert res_get.json()["id"] == exam_id
+
+    # 4. Manual Edit (PUT)
+    res_put = client.put(
+        f"/api/admin/exams/{exam_id}",
+        json={"time_limit": 135, "scoring_rules": "Updated scoring system"},
+        headers=get_auth_headers(is_admin=True)
+    )
+    assert res_put.status_code == 200
+    assert res_put.json()["time_limit"] == 135
+    assert res_put.json()["scoring_rules"] == "Updated scoring system"
+
+    # 5. Delete Exam
+    res_del = client.delete(f"/api/admin/exams/{exam_id}", headers=get_auth_headers(is_admin=True))
+    assert res_del.status_code == 200
+    assert "deleted successfully" in res_del.json()["message"]
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

@@ -37,6 +37,32 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user: UserProfileResponse
 
+# --- ADMIN EXAM MODELS ---
+
+class ExamResearchRequest(BaseModel):
+    exam_name: str
+
+class ExamProfileUpdate(BaseModel):
+    exam_name: Optional[str] = None
+    sections: Optional[List[Any]] = None
+    question_types: Optional[List[str]] = None
+    time_limit: Optional[int] = None
+    total_questions: Optional[int] = None
+    scoring_rules: Optional[str] = None
+    disclaimer_text: Optional[str] = None
+
+class ExamProfileFull(BaseModel):
+    id: str
+    exam_name: str
+    sections: List[Any] = []
+    question_types: List[str] = []
+    time_limit: Optional[int] = None
+    total_questions: Optional[int] = None
+    scoring_rules: Optional[str] = None
+    disclaimer_text: str
+
+    model_config = ConfigDict(from_attributes=True)
+
 # --- DOMAIN MODELS ---
 
 class DocumentBase(BaseModel):

@@ -38,6 +38,7 @@ async def get_current_user(
             return {
                 "user_id": user_id,
                 "email": payload.get("email"),
+                "is_admin": user_meta.get("is_admin", False) or payload.get("role") == "admin",
                 "grade_level": user_meta.get("grade_level"),
                 "exam_targets": user_meta.get("exam_targets", []),
                 "token": token
@@ -48,9 +49,11 @@ async def get_current_user(
             if not response or not response.user:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid user session")
             user_meta = getattr(response.user, "user_metadata", {}) or {}
+            is_admin = user_meta.get("is_admin", False) or getattr(response.user, "role", "") == "admin"
             return {
                 "user_id": response.user.id,
                 "email": response.user.email,
+                "is_admin": is_admin,
                 "grade_level": user_meta.get("grade_level"),
                 "exam_targets": user_meta.get("exam_targets", []),
                 "token": token
@@ -61,6 +64,20 @@ async def get_current_user(
             detail=f"Authentication failed: {str(e)}",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+async def get_admin_user(
+    user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """
+    Enforces admin authorization requirement.
+    Checks user.is_admin metadata flag or role.
+    """
+    if not user.get("is_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required to access this resource"
+        )
+    return user
 
 @router.post("/signup", response_model=UserProfileResponse)
 async def signup(payload: SignUpRequest):
