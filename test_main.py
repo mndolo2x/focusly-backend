@@ -1,3 +1,4 @@
+import os
 import pytest
 from fastapi.testclient import TestClient
 from main import app
@@ -36,9 +37,37 @@ def test_admin_exam_profiles():
     assert isinstance(profiles, list)
     assert len(profiles) >= 1
 
+def test_migration_sql_schema_exists():
+    sql_path = os.path.join(os.path.dirname(__file__), "migrations", "001_initial_schema.sql")
+    assert os.path.exists(sql_path)
+    with open(sql_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Verify tables
+    expected_tables = [
+        "public.documents", "public.summaries", "public.quiz_questions",
+        "public.quiz_attempts", "public.review_items", "public.study_plans",
+        "public.exam_profiles", "public.user_usage", "public.shared_links"
+    ]
+    for tbl in expected_tables:
+        assert tbl in content
+
+    # Verify indexes
+    expected_indexes = [
+        "idx_documents_user_id", "idx_documents_status",
+        "idx_quiz_attempts_user_id", "idx_review_items_user_id",
+        "idx_review_items_next_review_date"
+    ]
+    for idx in expected_indexes:
+        assert idx in content
+
+    # Verify functions & trigger
+    assert "get_user_usage" in content
+    assert "handle_new_user_usage" in content
+    assert "ROW LEVEL SECURITY" in content
+
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):
-    # Test error handling and retry mechanism when server is unavailable
     with pytest.raises(RuntimeError) as exc_info:
         await ollama_service.generate("Test prompt", max_retries=2, retry_delay=0.01)
     assert "Ollama connection error" in str(exc_info.value) or "Ollama" in str(exc_info.value)
