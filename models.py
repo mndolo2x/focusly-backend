@@ -1,13 +1,43 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 class DocumentStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
     VIDEO_READY = "video_ready"
+
+# --- AUTH MODELS ---
+
+class SignUpRequest(BaseModel):
+    email: str
+    password: str
+    grade_level: Optional[str] = None
+    exam_targets: Optional[List[str]] = []
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class UserMetadata(BaseModel):
+    grade_level: Optional[str] = None
+    exam_targets: Optional[List[str]] = []
+
+class UserProfileResponse(BaseModel):
+    id: str
+    email: str
+    grade_level: Optional[str] = None
+    exam_targets: Optional[List[str]] = []
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user: UserProfileResponse
+
+# --- DOMAIN MODELS ---
 
 class DocumentBase(BaseModel):
     filename: str

@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from admin.routes import router as admin_router
-from auth import get_current_user
+from auth import get_current_user, router as auth_router
 from config import settings
 from models import (
     DocumentResponse,
@@ -42,7 +42,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register Admin Router
+# Register Routers
+app.include_router(auth_router)
 app.include_router(admin_router)
 
 @app.get("/")
@@ -164,7 +165,6 @@ async def generate_video(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    # Mock/generate sections for video creation
     sections = [
         {"title": doc.get("filename", "Lesson"), "key_points": ["Key concept overview"], "explanation": doc.get("extracted_text", "")[:300]}
     ]

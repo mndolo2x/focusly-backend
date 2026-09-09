@@ -1,4 +1,5 @@
 import os
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 from main import app
@@ -43,7 +44,6 @@ def test_migration_sql_schema_exists():
     with open(sql_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Verify tables
     expected_tables = [
         "public.documents", "public.summaries", "public.quiz_questions",
         "public.quiz_attempts", "public.review_items", "public.study_plans",
@@ -52,7 +52,6 @@ def test_migration_sql_schema_exists():
     for tbl in expected_tables:
         assert tbl in content
 
-    # Verify indexes
     expected_indexes = [
         "idx_documents_user_id", "idx_documents_status",
         "idx_quiz_attempts_user_id", "idx_review_items_user_id",
@@ -61,10 +60,38 @@ def test_migration_sql_schema_exists():
     for idx in expected_indexes:
         assert idx in content
 
-    # Verify functions & trigger
     assert "get_user_usage" in content
     assert "handle_new_user_usage" in content
     assert "ROW LEVEL SECURITY" in content
+
+def test_auth_me_with_jwt_token(monkeypatch):
+    # Test protected /api/auth/me with mock JWT token
+    token = jwt.encode(
+        {"sub": "user_123", "email": "test@focusly.ai", "user_metadata": {"grade_level": "11th", "exam_targets": ["SAT"]}},
+        "test_secret",
+        algorithm="HS256"
+    )
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    response = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "user_123"
+    assert data["email"] == "test@focusly.ai"
+    assert data["grade_level"] == "11th"
+    assert data["exam_targets"] == ["SAT"]
+
+def test_auth_logout_with_jwt_token(monkeypatch):
+    token = jwt.encode(
+        {"sub": "user_123", "email": "test@focusly.ai"},
+        "test_secret",
+        algorithm="HS256"
+    )
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    response = client.post("/api/auth/logout", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json() == {"message": "Successfully logged out"}
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):
