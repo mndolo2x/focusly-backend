@@ -63,6 +63,43 @@ class ExamProfileFull(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+# --- EXAM PAPER GENERATOR MODELS ---
+
+EXAM_PAPER_DISCLAIMER = "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board."
+
+class ExamPaperGenerateRequest(BaseModel):
+    document_ids: List[str] = []
+    num_questions: int = Field(25, ge=1, le=100)
+
+class ExamPaperAnswerItem(BaseModel):
+    question_id: str
+    selected_answer: int
+    confidence_score: Optional[int] = 3
+
+class ExamPaperSubmission(BaseModel):
+    answers: List[ExamPaperAnswerItem]
+
+class ExamPaperResponse(BaseModel):
+    id: str
+    exam_id: str
+    exam_name: str
+    questions: List[Dict[str, Any]]
+    time_limit: Optional[int] = 60
+    total_questions: int
+    disclaimer_text: str = EXAM_PAPER_DISCLAIMER
+
+    model_config = ConfigDict(from_attributes=True)
+
+class ExamPaperGradeResponse(BaseModel):
+    paper_id: str
+    exam_id: str
+    score: float
+    total_questions: int
+    correct_count: int
+    incorrect_count: int
+    breakdown: List[Dict[str, Any]]
+    disclaimer_text: str = EXAM_PAPER_DISCLAIMER
+
 # --- DOMAIN MODELS ---
 
 class DocumentBase(BaseModel):

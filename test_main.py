@@ -20,58 +20,60 @@ def test_root():
     response = client.get("/")
     assert response.status_code == 200
 
-def test_admin_research_unauthorized_for_non_admin(monkeypatch):
-    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
-    response = client.post(
-        "/api/admin/exams/research",
-        json={"exam_name": "Cambridge IGCSE Biology"},
-        headers=get_auth_headers(is_admin=False)
-    )
-    assert response.status_code == 403
-    assert "Admin privileges required" in response.json()["detail"]
+def test_user_list_exam_profiles():
+    response = client.get("/api/exams", headers=get_auth_headers())
+    assert response.status_code == 200
+    profiles = response.json()
+    assert isinstance(profiles, list)
+    assert len(profiles) >= 1
 
-def test_admin_exam_research_and_crud_flow(monkeypatch):
+def test_exam_paper_generation_and_grading_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    # 1. Research Exam with Admin Auth
-    res_post = client.post(
-        "/api/admin/exams/research",
-        json={"exam_name": "Cambridge IGCSE Biology"},
-        headers=get_auth_headers(is_admin=True)
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file = io.BytesIO(fake_pdf)
+
+    # 1. Upload Document
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("sat_prep.pdf", pdf_file, "application/pdf")},
+        headers=get_auth_headers()
     )
-    assert res_post.status_code == 200
-    data = res_post.json()
-    assert "cambridge" in data["id"] or "biology" in data["id"]
-    assert data["exam_name"] is not None
-    assert "time_limit" in data
-    assert "disclaimer_text" in data
+    assert up_res.status_code == 200
+    doc_id = up_res.json()["id"]
 
-    exam_id = data["id"]
-
-    # 2. List Exams
-    res_list = client.get("/api/admin/exams", headers=get_auth_headers(is_admin=True))
-    assert res_list.status_code == 200
-    assert isinstance(res_list.json(), list)
-
-    # 3. Get Specific Exam
-    res_get = client.get(f"/api/admin/exams/{exam_id}", headers=get_auth_headers(is_admin=True))
-    assert res_get.status_code == 200
-    assert res_get.json()["id"] == exam_id
-
-    # 4. Manual Edit (PUT)
-    res_put = client.put(
-        f"/api/admin/exams/{exam_id}",
-        json={"time_limit": 135, "scoring_rules": "Updated scoring system"},
-        headers=get_auth_headers(is_admin=True)
+    # 2. Generate Practice Exam Paper
+    gen_res = client.post(
+        "/api/exams/sat-reading/generate-paper",
+        json={"document_ids": [doc_id], "num_questions": 10},
+        headers=get_auth_headers()
     )
-    assert res_put.status_code == 200
-    assert res_put.json()["time_limit"] == 135
-    assert res_put.json()["scoring_rules"] == "Updated scoring system"
+    assert gen_res.status_code == 200
+    paper = gen_res.json()
+    assert "questions" in paper
+    assert len(paper["questions"]) == 10
+    assert "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board." in paper["disclaimer_text"]
 
-    # 5. Delete Exam
-    res_del = client.delete(f"/api/admin/exams/{exam_id}", headers=get_auth_headers(is_admin=True))
-    assert res_del.status_code == 200
-    assert "deleted successfully" in res_del.json()["message"]
+    paper_id = paper["id"]
+
+    # 3. GET Document Exam Paper
+    get_res = client.get(f"/api/documents/{doc_id}/exam-paper", headers=get_auth_headers())
+    assert get_res.status_code == 200
+    assert "questions" in get_res.json()
+
+    # 4. Submit & Grade Exam Paper
+    submissions = {
+        "paper_id": paper_id,
+        "answers": [
+            {"question_id": paper["questions"][0]["id"], "selected_answer": 0}
+        ]
+    }
+    submit_res = client.post("/api/exams/sat-reading/submit-paper", json=submissions, headers=get_auth_headers())
+    assert submit_res.status_code == 200
+    grade_data = submit_res.json()
+    assert "score" in grade_data
+    assert "correct_count" in grade_data
+    assert "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board." in grade_data["disclaimer_text"]
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

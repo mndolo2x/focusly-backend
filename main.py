@@ -18,6 +18,11 @@ from models import (
     SharedLinkCreate,
     SharedLinkResponse,
     AIContentDisclaimer,
+    ExamPaperGenerateRequest,
+    ExamPaperSubmission,
+    ExamPaperResponse,
+    ExamPaperGradeResponse,
+    EXAM_PAPER_DISCLAIMER,
 )
 from services.document_service import document_service
 from services.summary_service import summary_service
@@ -70,6 +75,62 @@ async def ollama_health_check():
 async def tts_health_check():
     """Health check endpoint for local Kokoro TTS engine status."""
     return await tts_service.check_health()
+
+# --- Public Exam Profile Endpoints ---
+
+@app.get("/api/exams")
+@app.get("/exams")
+async def list_user_exam_profiles():
+    """Returns available exam profiles for users."""
+    from admin.routes import list_all_exam_profiles
+    return await list_all_exam_profiles()
+
+@app.post("/api/exams/{exam_id}/generate-paper", response_model=Dict[str, Any])
+async def generate_exam_paper_endpoint(
+    exam_id: str,
+    payload: ExamPaperGenerateRequest,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Uses exam profile + Ollama to generate practice questions matching the exact exam format.
+    CRITICAL: Response includes disclaimer: "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board."
+    """
+    paper = await study_service.generate_exam_paper(
+        user["user_id"], exam_id, payload.document_ids, payload.num_questions
+    )
+    return paper
+
+@app.get("/api/documents/{document_id}/exam-paper")
+async def get_document_exam_paper_endpoint(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns generated practice exam paper for a specific document."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    paper = await study_service.get_document_exam_paper(document_id)
+    if not paper:
+        # Fallback inline generation if paper not pre-generated
+        paper = await study_service.generate_exam_paper(user["user_id"], "practice_exam", [document_id], num_questions=25)
+
+    return paper
+
+@app.post("/api/exams/{exam_id}/submit-paper")
+async def submit_exam_paper_endpoint(
+    exam_id: str,
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Grades submitted paper and returns score breakdown with mandatory disclaimer text.
+    """
+    paper_id = payload.get("paper_id") or exam_id
+    answers = payload.get("answers") or payload.get("submissions") or []
+
+    results = await study_service.submit_exam_paper(user["user_id"], paper_id, answers)
+    return results
 
 # --- Document Endpoints ---
 
