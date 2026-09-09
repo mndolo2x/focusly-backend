@@ -16,3 +16,4 @@ ffmpeg-python
 faiss-cpu
 pytest
 httpx
+PyJWT

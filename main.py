@@ -279,6 +279,50 @@ async def submit_document_quiz(
     results = await quiz_service.submit_quiz_batch(user["user_id"], document_id, submissions)
     return results
 
+# --- Weak Area Tracking Endpoints ---
+
+@app.get("/api/documents/{document_id}/weak-areas")
+async def get_document_weak_areas(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns sections/pages where user answered incorrectly with miss counts and priority scores."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    weak_areas = await quiz_service.get_document_weak_areas(user["user_id"], document_id)
+    return weak_areas
+
+@app.post("/api/documents/{document_id}/weak-areas/review")
+async def mark_weak_area_reviewed(
+    document_id: str,
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Marks a specific weak area (section_index and page_reference) as reviewed."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    sec_idx = payload.get("section_index", 0)
+    page_ref = payload.get("page_reference", 1)
+
+    await quiz_service.mark_weak_area_reviewed(user["user_id"], document_id, sec_idx, page_ref)
+    return {
+        "message": "Weak area marked as reviewed successfully",
+        "document_id": document_id,
+        "section_index": sec_idx,
+        "page_reference": page_ref
+    }
+
+@app.get("/api/dashboard/weak-areas")
+async def get_dashboard_weak_areas(
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Aggregates weak areas across ALL user documents, sorted by most-missed/priority score."""
+    return await quiz_service.get_dashboard_weak_areas(user["user_id"])
+
 # Legacy Quiz compatibility endpoints
 @app.post("/quizzes/generate/{document_id}", response_model=List[Dict[str, Any]])
 async def legacy_generate_quiz(

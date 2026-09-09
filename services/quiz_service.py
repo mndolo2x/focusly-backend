@@ -7,6 +7,7 @@ from services.summary_service import summary_service
 # In-memory stores for unit tests / local fallback
 _in_memory_questions: Dict[str, List[Dict[str, Any]]] = {}
 _in_memory_attempts: List[Dict[str, Any]] = []
+_reviewed_weak_areas: set = set() # (user_id, document_id, section_index, page_reference)
 
 class QuizService:
     """Service for generating quiz questions from summaries, evaluating attempts, and identifying weak study areas."""
@@ -46,7 +47,6 @@ class QuizService:
             raw_questions = []
 
         if not raw_questions or len(raw_questions) < num_questions:
-            # Fallback question generator if LLM response incomplete
             fallback_qs = []
             for i in range(num_questions):
                 sec_idx = i % (len(sections) if sections else 1)
@@ -120,7 +120,7 @@ class QuizService:
         correct_count = 0
         incorrect_count = 0
         breakdown = []
-        section_stats: Dict[int, Dict[str, int]] = {} # section_index -> {correct, total, low_confidence}
+        section_stats: Dict[int, Dict[str, int]] = {}
 
         for sub in submissions:
             q_id = sub.get("question_id")
@@ -148,6 +148,7 @@ class QuizService:
             attempt_record = {
                 "id": str(uuid.uuid4()),
                 "user_id": user_id,
+                "document_id": document_id,
                 "question_id": q_id,
                 "selected_answer": selected_ans,
                 "is_correct": is_correct,
@@ -172,24 +173,7 @@ class QuizService:
 
         score_pct = round((correct_count / total_questions) * 100, 2) if total_questions > 0 else 0.0
 
-        # Identify weak areas (accuracy < 60% or high proportion of low confidence)
-        weak_areas = []
-        summary = await summary_service.get_latest_summary(document_id)
-        sections = summary.get("sections", []) if summary else []
-
-        for sec_idx, stats in section_stats.items():
-            tot = stats["total"]
-            accuracy = (stats["correct"] / tot) if tot > 0 else 0.0
-            if accuracy < 0.60 or stats["low_confidence"] > 0:
-                sec_title = f"Section {sec_idx+1}"
-                if sections and sec_idx < len(sections):
-                    sec_title = sections[sec_idx].get("title", sec_title)
-                weak_areas.append({
-                    "section_index": sec_idx,
-                    "section_title": sec_title,
-                    "accuracy": round(accuracy * 100, 1),
-                    "low_confidence_count": stats["low_confidence"]
-                })
+        weak_areas = await self.get_document_weak_areas(user_id, document_id)
 
         return {
             "document_id": document_id,
@@ -200,6 +184,156 @@ class QuizService:
             "breakdown": breakdown,
             "weak_areas": weak_areas
         }
+
+    async def get_document_weak_areas(self, user_id: str, document_id: str) -> List[Dict[str, Any]]:
+        """
+        Aggregates incorrect attempts by section and page for a specific document.
+        Prioritizes sections/pages with low confidence score (<=2) AND incorrect answers.
+        """
+        questions = await self.get_quiz_questions(document_id)
+        q_map = {q["id"]: q for q in questions}
+
+        # Gather user attempts
+        user_attempts = [a for a in _in_memory_attempts if a.get("user_id") == user_id]
+        if document_id:
+            user_attempts = [a for a in user_attempts if a.get("document_id") == document_id or a.get("question_id") in q_map]
+
+        try:
+            res = supabase.table("quiz_attempts").select("*").eq("user_id", user_id).execute()
+            if res.data:
+                db_attempts = [a for a in res.data if a.get("question_id") in q_map]
+                user_attempts.extend(db_attempts)
+        except Exception:
+            pass
+
+        summary = await summary_service.get_latest_summary(document_id)
+        sections = summary.get("sections", []) if summary else []
+
+        aggregated: Dict[tuple, Dict[str, Any]] = {} # (section_index, page_reference) -> stats
+
+        for att in user_attempts:
+            q_id = att.get("question_id")
+            q = q_map.get(q_id)
+            if not q:
+                continue
+
+            sec_idx = q.get("section_index", 0)
+            page_ref = q.get("page_reference", 1)
+            key = (sec_idx, page_ref)
+
+            if key in _reviewed_weak_areas or (user_id, document_id, sec_idx, page_ref) in _reviewed_weak_areas:
+                continue
+
+            if key not in aggregated:
+                sec_title = f"Section {sec_idx+1}"
+                if sections and sec_idx < len(sections):
+                    sec_title = sections[sec_idx].get("title", sec_title)
+
+                aggregated[key] = {
+                    "document_id": document_id,
+                    "section_index": sec_idx,
+                    "section_title": sec_title,
+                    "page_reference": page_ref,
+                    "miss_count": 0,
+                    "low_confidence_miss_count": 0,
+                    "priority_score": 0.0,
+                    "reviewed": False
+                }
+
+            if not att.get("is_correct"):
+                aggregated[key]["miss_count"] += 1
+                conf = att.get("confidence_score", 3)
+                if conf <= 2:
+                    aggregated[key]["low_confidence_miss_count"] += 1
+
+        results = []
+        for key, stats in aggregated.items():
+            if stats["miss_count"] > 0:
+                # Priority calculation: base miss_count + 2x multiplier for low confidence misses
+                priority = stats["miss_count"] + (stats["low_confidence_miss_count"] * 2)
+                stats["priority_score"] = float(priority)
+                results.append(stats)
+
+        results.sort(key=lambda x: (x["priority_score"], x["miss_count"]), reverse=True)
+        return results
+
+    async def mark_weak_area_reviewed(self, user_id: str, document_id: str, section_index: int, page_reference: int) -> bool:
+        """Marks a specific weak area as reviewed."""
+        _reviewed_weak_areas.add((user_id, document_id, section_index, page_reference))
+        return True
+
+    async def get_dashboard_weak_areas(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Aggregates weak areas across ALL documents for the user,
+        prioritizing sections/pages with low confidence and high miss counts.
+        """
+        all_attempts = [a for a in _in_memory_attempts if a.get("user_id") == user_id]
+
+        try:
+            res = supabase.table("quiz_attempts").select("*").eq("user_id", user_id).execute()
+            if res.data:
+                all_attempts.extend(res.data)
+        except Exception:
+            pass
+
+        # Collect all questions
+        all_q_ids = list(set([a.get("question_id") for a in all_attempts if a.get("question_id")]))
+        q_map = {}
+        for doc_qs in _in_memory_questions.values():
+            for q in doc_qs:
+                q_map[q["id"]] = q
+
+        try:
+            if all_q_ids:
+                res_q = supabase.table("quiz_questions").select("*").in_("id", all_q_ids).execute()
+                if res_q.data:
+                    for q in res_q.data:
+                        q_map[q["id"]] = q
+        except Exception:
+            pass
+
+        aggregated: Dict[tuple, Dict[str, Any]] = {} # (doc_id, sec_idx, page_ref) -> stats
+
+        for att in all_attempts:
+            q_id = att.get("question_id")
+            q = q_map.get(q_id)
+            if not q:
+                continue
+
+            doc_id = q.get("document_id") or att.get("document_id", "unknown_doc")
+            sec_idx = q.get("section_index", 0)
+            page_ref = q.get("page_reference", 1)
+            key = (doc_id, sec_idx, page_ref)
+
+            if (user_id, doc_id, sec_idx, page_ref) in _reviewed_weak_areas:
+                continue
+
+            if key not in aggregated:
+                aggregated[key] = {
+                    "document_id": doc_id,
+                    "section_index": sec_idx,
+                    "section_title": f"Section {sec_idx+1}",
+                    "page_reference": page_ref,
+                    "miss_count": 0,
+                    "low_confidence_miss_count": 0,
+                    "priority_score": 0.0,
+                    "reviewed": False
+                }
+
+            if not att.get("is_correct"):
+                aggregated[key]["miss_count"] += 1
+                if att.get("confidence_score", 3) <= 2:
+                    aggregated[key]["low_confidence_miss_count"] += 1
+
+        results = []
+        for key, stats in aggregated.items():
+            if stats["miss_count"] > 0:
+                priority = stats["miss_count"] + (stats["low_confidence_miss_count"] * 2)
+                stats["priority_score"] = float(priority)
+                results.append(stats)
+
+        results.sort(key=lambda x: (x["priority_score"], x["miss_count"]), reverse=True)
+        return results
 
     async def submit_attempt(self, user_id: str, question_id: str, selected_answer: int, confidence_score: int) -> Dict[str, Any]:
         """Single attempt submission compatibility helper."""

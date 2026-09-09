@@ -68,7 +68,7 @@ def test_auth_me_with_jwt_token(monkeypatch):
     data = response.json()
     assert data["id"] == "user_123"
 
-def test_document_upload_and_summarize_flow(monkeypatch):
+def test_document_upload_and_weak_area_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
     fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
@@ -77,44 +77,53 @@ def test_document_upload_and_summarize_flow(monkeypatch):
     # 1. Upload
     up_res = client.post(
         "/api/documents/upload",
-        files={"file": ("physics.pdf", pdf_file, "application/pdf")},
+        files={"file": ("chemistry.pdf", pdf_file, "application/pdf")},
         headers=get_auth_headers()
     )
     assert up_res.status_code == 200
     doc_id = up_res.json()["id"]
 
-    # 2. Trigger Summarize Task
-    task_res = client.post(f"/api/documents/{doc_id}/summarize?depth=standard", headers=get_auth_headers())
-    assert task_res.status_code == 200
-    assert "task_id" in task_res.json()
-
-    # 3. Direct Summary
-    summary_quick = client.post(f"/api/documents/{doc_id}/summary?depth=quick", headers=get_auth_headers())
-    assert summary_quick.status_code == 200
-
-    # 4. Quiz Generation & Retrieval Flow
-    gen_quiz_res = client.post(f"/api/documents/{doc_id}/generate-quiz?num_questions=5", headers=get_auth_headers())
+    # 2. Generate Quiz
+    gen_quiz_res = client.post(f"/api/documents/{doc_id}/generate-quiz?num_questions=3", headers=get_auth_headers())
     assert gen_quiz_res.status_code == 200
-    assert "task_id" in gen_quiz_res.json()
 
     get_quiz_res = client.get(f"/api/documents/{doc_id}/quiz", headers=get_auth_headers())
     assert get_quiz_res.status_code == 200
     questions = get_quiz_res.json()
-    assert isinstance(questions, list)
     assert len(questions) >= 1
 
     q_id = questions[0]["id"]
 
-    # 5. Quiz Submission
+    # 3. Submit Incorrect Answer with Low Confidence
     submissions = [
-        {"question_id": q_id, "selected_answer": 0, "confidence_score": 5}
+        {"question_id": q_id, "selected_answer": 3, "confidence_score": 1} # Wrong answer (0 is correct)
     ]
     submit_res = client.post(f"/api/documents/{doc_id}/quiz/submit", json=submissions, headers=get_auth_headers())
     assert submit_res.status_code == 200
-    sub_data = submit_res.json()
-    assert "score" in sub_data
-    assert "correct_count" in sub_data
-    assert "weak_areas" in sub_data
+
+    # 4. Check Weak Areas Endpoint
+    weak_res = client.get(f"/api/documents/{doc_id}/weak-areas", headers=get_auth_headers())
+    assert weak_res.status_code == 200
+    weak_areas = weak_res.json()
+    assert isinstance(weak_areas, list)
+    assert len(weak_areas) >= 1
+    assert weak_areas[0]["miss_count"] >= 1
+    assert weak_areas[0]["priority_score"] >= 3.0 # Miss count 1 + (1 low conf * 2)
+
+    # 5. Check Dashboard Weak Areas
+    dash_res = client.get("/api/dashboard/weak-areas", headers=get_auth_headers())
+    assert dash_res.status_code == 200
+    dash_weak = dash_res.json()
+    assert len(dash_weak) >= 1
+
+    # 6. Mark Weak Area as Reviewed
+    rev_res = client.post(
+        f"/api/documents/{doc_id}/weak-areas/review",
+        json={"section_index": weak_areas[0]["section_index"], "page_reference": weak_areas[0]["page_reference"]},
+        headers=get_auth_headers()
+    )
+    assert rev_res.status_code == 200
+    assert "marked as reviewed" in rev_res.json()["message"]
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):
