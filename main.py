@@ -23,6 +23,7 @@ from services.summary_service import summary_service
 from services.quiz_service import quiz_service
 from services.video_service import video_service
 from services.study_service import study_service
+from services.ollama_service import ollama_service
 from utils.rag_engine import rag_engine
 from workers.tasks import process_document_task
 
@@ -54,6 +55,11 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "environment": settings.ENVIRONMENT}
+
+@app.get("/api/health/ollama")
+async def ollama_health_check():
+    """Health check endpoint for local Ollama LLM server status."""
+    return await ollama_service.check_health()
 
 # --- Document Endpoints ---
 
