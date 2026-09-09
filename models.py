@@ -100,6 +100,40 @@ class ExamPaperGradeResponse(BaseModel):
     breakdown: List[Dict[str, Any]]
     disclaimer_text: str = EXAM_PAPER_DISCLAIMER
 
+# --- STUDY PLAN BUILDER MODELS ---
+
+class StudyPlanCreateAI(BaseModel):
+    exam_date: datetime
+    subject: str
+    documents: Optional[List[str]] = []
+
+class StudyPlanUpdateAI(BaseModel):
+    exam_date: Optional[datetime] = None
+    subject: Optional[str] = None
+    documents: Optional[List[str]] = None
+
+class StudyPlanTaskItem(BaseModel):
+    id: str
+    type: str  # review, quiz, video, read
+    document_id: Optional[str] = None
+    description: str
+    completed: bool = False
+
+class StudyPlanDaySchedule(BaseModel):
+    day: int
+    date: Optional[str] = None
+    tasks: List[StudyPlanTaskItem] = []
+
+class StudyPlanFull(BaseModel):
+    id: str
+    user_id: str
+    exam_date: datetime
+    subject: str
+    schedule: List[Dict[str, Any]] = []
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
 # --- DOMAIN MODELS ---
 
 class DocumentBase(BaseModel):

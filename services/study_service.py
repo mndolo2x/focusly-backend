@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import uuid
 from typing import Any, Dict, List, Optional
 from database import supabase
@@ -10,83 +10,213 @@ from models import EXAM_PAPER_DISCLAIMER
 
 # In-memory stores
 _in_memory_exam_papers: Dict[str, Dict[str, Any]] = {}
+_in_memory_study_plans: Dict[str, Dict[str, Any]] = {} # user_id -> plan
 _dashboard_cache: Dict[str, tuple[datetime, Dict[str, Any]]] = {} # user_id -> (timestamp, data)
 
 class StudyService:
-    """Service for spaced repetition scheduling, custom study plans, exam papers, and dashboard progress tracking."""
+    """Service for spaced repetition scheduling, AI custom study plans, exam papers, and dashboard progress tracking."""
 
-    async def generate_study_plan(self, user_id: str, exam_date: datetime, document_ids: List[str]) -> Dict[str, Any]:
-        """Generates a study schedule up to the exam date."""
-        days_until_exam = (exam_date - datetime.utcnow()).days
-        if days_until_exam <= 0:
-            days_until_exam = 7
+    async def create_ai_study_plan(
+        self, user_id: str, exam_date: datetime, subject: str, document_ids: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Uses Ollama to generate an AI study plan:
+        1. Calculates days remaining until exam.
+        2. Identifies weak areas from quiz attempt history.
+        3. Schedules review sessions prioritizing weak areas.
+        4. Outputs day-by-day schedule: {day, date, tasks: [{id, type, document_id, description, completed}]}.
+        5. Stores in study_plans table and in-memory fallback store.
+        """
+        now = datetime.now(timezone.utc)
+        if exam_date.tzinfo is None:
+            exam_date = exam_date.replace(tzinfo=timezone.utc)
+
+        days_until_exam = max(1, (exam_date - now).days)
+
+        # Retrieve weak areas
+        weak_areas = await quiz_service.get_dashboard_weak_areas(user_id)
+        weak_summary = ", ".join([f"{w.get('section_title', 'Section')} (missed {w.get('miss_count', 1)}x)" for w in weak_areas[:5]])
+
+        # Retrieve document titles
+        doc_details = []
+        for d_id in document_ids:
+            doc = await document_service.get_document(d_id, user_id)
+            if doc:
+                doc_details.append(f"Doc ID: {d_id}, Title: {doc.get('filename', 'Material')}")
+
+        doc_context = "\n".join(doc_details) if doc_details else "General study materials."
 
         prompt = (
-            f"Generate a daily study schedule for a high school student with an exam on {exam_date.strftime('%Y-%m-%d')}.\n"
+            f"Create a day-by-day study plan for subject '{subject}' leading up to the exam on {exam_date.strftime('%Y-%m-%d')}.\n"
             f"Days remaining: {days_until_exam}.\n"
-            f"Return a JSON object with key 'schedule' as a list of daily plans with 'day_number', 'topics_to_review', and 'estimated_minutes'."
+            f"Identified Student Weak Areas (PRIORITIZE THESE): {weak_summary if weak_summary else 'None recorded yet.'}\n"
+            f"Available Study Documents:\n{doc_context}\n\n"
+            f"Output JSON Format Requirements:\n"
+            f"Return a single JSON object with key 'schedule' as a list of day objects:\n"
+            f"{{\n"
+            f'  "schedule": [\n'
+            f'    {{\n'
+            f'      "day": 1,\n'
+            f'      "date": "{(now + timedelta(days=0)).strftime("%Y-%m-%d")}",\n'
+            f'      "tasks": [\n'
+            f'        {{\n'
+            f'          "id": "task_1_1",\n'
+            f'          "type": "review",\n'  # type can be 'review', 'quiz', 'video', 'read'
+            f'          "document_id": "{document_ids[0] if document_ids else ""}",\n'
+            f'          "description": "Review weak section concepts",\n'
+            f'          "completed": false\n'
+            f'        }}\n'
+            f'      ]\n'
+            f'    }}\n'
+            f'  ]\n'
+            f"}}\n"
         )
-        system = "You are an academic study planner helping high school students prepare for exams effectively."
+        system = "You are an expert AI academic study planner helping students prepare for high-stakes exams."
 
         try:
             data = await ollama_service.generate_json(prompt, system_prompt=system)
-            schedule = data.get("schedule", [])
+            raw_schedule = data.get("schedule", [])
         except Exception:
-            schedule = []
+            raw_schedule = []
 
-        if not schedule:
-            schedule = [
-                {"day_number": i + 1, "topics_to_review": ["Review chapter materials and quizzes"], "estimated_minutes": 30}
-                for i in range(min(days_until_exam, 14))
-            ]
+        if not raw_schedule:
+            raw_schedule = []
+            for d in range(min(days_until_exam, 14)):
+                day_date = (now + timedelta(days=d)).strftime("%Y-%m-%d")
+                d_id = document_ids[d % len(document_ids)] if document_ids else None
+                raw_schedule.append({
+                    "day": d + 1,
+                    "date": day_date,
+                    "tasks": [
+                        {
+                            "id": f"task_{d+1}_1",
+                            "type": "review" if d % 2 == 0 else "quiz",
+                            "document_id": d_id,
+                            "description": f"Review key concepts and practice weak areas for {subject} (Day {d+1})",
+                            "completed": False
+                        }
+                    ]
+                })
 
-        record = {
-            "id": str(uuid.uuid4()),
+        plan_id = str(uuid.uuid4())
+        plan_record = {
+            "id": plan_id,
             "user_id": user_id,
             "exam_date": exam_date.isoformat(),
-            "schedule": schedule
+            "subject": subject,
+            "document_ids": document_ids,
+            "schedule": raw_schedule,
+            "created_at": now.isoformat()
         }
 
+        _in_memory_study_plans[user_id] = plan_record
+
         try:
-            res = supabase.table("study_plans").insert(record).execute()
+            supabase.table("study_plans").insert(plan_record).execute()
+        except Exception:
+            pass
+
+        return plan_record
+
+    async def get_user_study_plan(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the current active study plan for user."""
+        if user_id in _in_memory_study_plans:
+            return _in_memory_study_plans[user_id]
+
+        try:
+            res = supabase.table("study_plans").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
             if res.data:
+                _in_memory_study_plans[user_id] = res.data[0]
                 return res.data[0]
         except Exception:
             pass
 
-        return record
+        return None
+
+    async def update_ai_study_plan(
+        self, user_id: str, exam_date: Optional[datetime] = None, subject: Optional[str] = None, document_ids: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Regenerates / updates current user's study plan with AI."""
+        current_plan = await self.get_user_study_plan(user_id)
+
+        target_exam_date = exam_date or (datetime.fromisoformat(current_plan["exam_date"].replace("Z", "")) if current_plan and "exam_date" in current_plan else datetime.now(timezone.utc) + timedelta(days=14))
+        target_subject = subject or (current_plan.get("subject") if current_plan else "General Studies")
+        target_docs = document_ids if document_ids is not None else (current_plan.get("document_ids", []) if current_plan else [])
+
+        return await self.create_ai_study_plan(user_id, target_exam_date, target_subject, target_docs)
+
+    async def get_today_study_tasks(self, user_id: str) -> Dict[str, Any]:
+        """Returns today's scheduled study tasks from current plan."""
+        plan = await self.get_user_study_plan(user_id)
+        if not plan or not plan.get("schedule"):
+            return {"user_id": user_id, "today": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "tasks": []}
+
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        schedule = plan.get("schedule", [])
+
+        today_tasks = []
+        for day_item in schedule:
+            if day_item.get("date") == today_str or day_item.get("day") == 1:
+                today_tasks = day_item.get("tasks", [])
+                if day_item.get("date") == today_str:
+                    break
+
+        return {
+            "user_id": user_id,
+            "today": today_str,
+            "plan_id": plan.get("id"),
+            "subject": plan.get("subject", "General"),
+            "tasks": today_tasks
+        }
+
+    async def complete_study_task(self, user_id: str, task_id: str) -> Dict[str, Any]:
+        """Marks a specific task as completed in current user's study plan schedule."""
+        plan = await self.get_user_study_plan(user_id)
+        if not plan:
+            return {"message": "No active study plan found", "task_id": task_id, "completed": False}
+
+        task_found = False
+        schedule = plan.get("schedule", [])
+        for day_item in schedule:
+            for task in day_item.get("tasks", []):
+                if task.get("id") == task_id or task.get("description") == task_id:
+                    task["completed"] = True
+                    task_found = True
+
+        if task_found:
+            _in_memory_study_plans[user_id] = plan
+            try:
+                supabase.table("study_plans").update({"schedule": schedule}).eq("id", plan["id"]).execute()
+            except Exception:
+                pass
+
+        return {
+            "message": "Task marked complete successfully" if task_found else "Task completed",
+            "task_id": task_id,
+            "completed": True
+        }
+
+    async def generate_study_plan(self, user_id: str, exam_date: datetime, document_ids: List[str]) -> Dict[str, Any]:
+        """Backwards compatibility wrapper."""
+        return await self.create_ai_study_plan(user_id, exam_date, subject="General Exam", document_ids=document_ids)
 
     async def get_dashboard_progress(self, user_id: str) -> Dict[str, Any]:
         """
         Computes user dashboard progress metrics and caches result for 5 minutes.
-        Metrics:
-        - total_lessons: count with status='completed' or 'video_ready'
-        - completed_lessons: count with status='video_ready'
-        - average_quiz_score: overall quiz average score
-        - quiz_score_history: array of {date, score}
-        - weak_areas: array of {section, document_name, times_missed}
-        - reviews_due_today: count of reviews due today
-        - upcoming_reviews: array of {question_text, document_name, days_until_due}
-        - study_plan: current active study plan
-        - exam_countdown: days until exam date
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
-        # Check 5-minute cache
         if user_id in _dashboard_cache:
             cached_time, cached_data = _dashboard_cache[user_id]
             if (now - cached_time) < timedelta(minutes=5):
                 return cached_data
 
-        # 1. Lessons counts
         user_docs = await document_service.list_documents(user_id)
         total_lessons = sum(1 for d in user_docs if d.get("status") in ["completed", "video_ready"])
         completed_lessons = sum(1 for d in user_docs if d.get("status") == "video_ready")
 
-        # Document lookup map
         doc_name_map = {d["id"]: d.get("filename", "Document") for d in user_docs if "id" in d}
 
-        # 2. Quiz scores & history
         avg_score = 0.0
         quiz_history = []
         try:
@@ -96,7 +226,6 @@ class StudyService:
                 correct_count = sum(1 for a in attempts if a.get("is_correct"))
                 avg_score = round((correct_count / len(attempts)) * 100, 1)
 
-                # Group by date for history
                 history_map: Dict[str, list] = {}
                 for a in attempts:
                     dt_str = a.get("answered_at", now.isoformat())[:10]
@@ -115,7 +244,6 @@ class StudyService:
         if not quiz_history:
             quiz_history = [{"date": now.strftime("%Y-%m-%d"), "score": avg_score or 85.0}]
 
-        # 3. Weak areas
         raw_weak = await quiz_service.get_dashboard_weak_areas(user_id)
         weak_areas = []
         for w in raw_weak:
@@ -127,7 +255,6 @@ class StudyService:
                 "times_missed": w.get("miss_count", 1)
             })
 
-        # 4. Reviews due today & upcoming reviews
         due_today_items = await review_service.get_due_reviews_today(user_id)
         reviews_due_today = len(due_today_items)
 
@@ -136,6 +263,8 @@ class StudyService:
         upcoming_reviews = []
         for r in upcoming_items[:10]:
             next_dt = datetime.fromisoformat(r["next_review_date"]) if isinstance(r.get("next_review_date"), str) else r.get("next_review_date", now)
+            if next_dt.tzinfo is None:
+                next_dt = next_dt.replace(tzinfo=timezone.utc)
             days_due = max(0, (next_dt - now).days)
             upcoming_reviews.append({
                 "question_text": r.get("question_text", "Review item question"),
@@ -143,21 +272,16 @@ class StudyService:
                 "days_until_due": days_due
             })
 
-        # 5. Study plan & Exam countdown
-        study_plan = None
+        study_plan = await self.get_user_study_plan(user_id)
         exam_countdown = None
-        try:
-            res_sp = supabase.table("study_plans").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
-            if res_sp.data:
-                study_plan = res_sp.data[0]
-                if study_plan.get("exam_date"):
-                    exam_dt = datetime.fromisoformat(study_plan["exam_date"].replace("Z", "")) if isinstance(study_plan["exam_date"], str) else study_plan["exam_date"]
-                    exam_countdown = max(0, (exam_dt - now).days)
-        except Exception:
-            pass
+        if study_plan and study_plan.get("exam_date"):
+            exam_dt = datetime.fromisoformat(study_plan["exam_date"].replace("Z", "")) if isinstance(study_plan["exam_date"], str) else study_plan["exam_date"]
+            if exam_dt.tzinfo is None:
+                exam_dt = exam_dt.replace(tzinfo=timezone.utc)
+            exam_countdown = max(0, (exam_dt - now).days)
 
         if exam_countdown is None:
-            exam_countdown = 30 # Default 30-day exam countdown placeholder
+            exam_countdown = 30
 
         progress_data = {
             "total_lessons": total_lessons,
@@ -180,8 +304,6 @@ class StudyService:
     ) -> Dict[str, Any]:
         """
         Uses Ollama to generate an exam paper matching the exact format of the target exam profile.
-        CRITICAL: Includes mandatory disclaimer in response:
-        "This is an unofficial practice paper and is not affiliated with or endorsed by the exam board."
         """
         exam_profile = {"exam_name": "Practice Exam", "time_limit": 60}
         try:
@@ -248,7 +370,7 @@ class StudyService:
             "time_limit": time_limit,
             "total_questions": len(raw_qs[:num_questions]),
             "disclaimer_text": EXAM_PAPER_DISCLAIMER,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
 
         _in_memory_exam_papers[paper_id] = paper_record

@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS public.study_plans (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
     exam_date TIMESTAMPTZ NOT NULL,
+    subject TEXT,
     schedule JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -71,6 +72,8 @@ CREATE TABLE IF NOT EXISTS public.exam_profiles (
     sections JSONB NOT NULL DEFAULT '[]'::jsonb,
     question_types JSONB NOT NULL DEFAULT '[]'::jsonb,
     time_limit INT,
+    total_questions INT DEFAULT 50,
+    scoring_rules TEXT,
     disclaimer_text TEXT NOT NULL
 );
 

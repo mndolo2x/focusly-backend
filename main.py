@@ -23,6 +23,8 @@ from models import (
     ExamPaperResponse,
     ExamPaperGradeResponse,
     EXAM_PAPER_DISCLAIMER,
+    StudyPlanCreateAI,
+    StudyPlanUpdateAI,
 )
 from services.document_service import document_service
 from services.summary_service import summary_service
@@ -88,6 +90,56 @@ async def get_dashboard_progress(
     weak_areas, reviews_due_today, upcoming_reviews, study_plan, exam_countdown.
     """
     return await study_service.get_dashboard_progress(user["user_id"])
+
+# --- AI Study Plan Builder Endpoints ---
+
+@app.post("/api/study-plan")
+async def create_study_plan_endpoint(
+    payload: StudyPlanCreateAI,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Creates an AI-powered study plan calculating days remaining, prioritizing weak areas,
+    and generating a day-by-day task schedule.
+    """
+    return await study_service.create_ai_study_plan(
+        user["user_id"], payload.exam_date, payload.subject, payload.documents or []
+    )
+
+@app.get("/api/study-plan")
+async def get_study_plan_endpoint(
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns current active study plan for user."""
+    plan = await study_service.get_user_study_plan(user["user_id"])
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active study plan found")
+    return plan
+
+@app.put("/api/study-plan")
+async def update_study_plan_endpoint(
+    payload: StudyPlanUpdateAI,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Regenerates/updates current study plan."""
+    return await study_service.update_ai_study_plan(
+        user["user_id"], payload.exam_date, payload.subject, payload.documents
+    )
+
+@app.get("/api/study-plan/today")
+async def get_today_study_tasks_endpoint(
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns today's scheduled study tasks."""
+    return await study_service.get_today_study_tasks(user["user_id"])
+
+@app.post("/api/study-plan/tasks/{task_id}/complete")
+async def complete_study_task_endpoint(
+    task_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Marks a specific study task as complete."""
+    return await study_service.complete_study_task(user["user_id"], task_id)
 
 # --- Public Exam Profile Endpoints ---
 
