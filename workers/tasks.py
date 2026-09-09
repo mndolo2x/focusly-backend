@@ -71,6 +71,28 @@ def generate_quiz_task(document_id: str, num_questions: int = 10):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@celery_app.task(
+    name="workers.tasks.generate_video_task",
+    autoretry_for=(Exception,),
+    retry_kwargs={"max_retries": 3, "countdown": 5}
+)
+def generate_video_task(document_id: str):
+    """
+    Celery task with 3 retries and exponential backoff to generate narrated MP4 video lesson:
+    1. Sets document status='processing'.
+    2. Calls Kokoro TTS for audio and Pillow for 1080p white slides with page numbers.
+    3. Assembles MP4 video using FFmpeg.
+    4. Uploads MP4 to Supabase Storage.
+    5. Updates document status='video_ready' and stores public video URL.
+    """
+    try:
+        asyncio.run(document_service.update_document(document_id, {"status": "processing"}))
+        video_url = asyncio.run(video_service.generate_video_lesson(document_id))
+        return {"status": "success", "document_id": document_id, "video_url": video_url}
+    except Exception as e:
+        asyncio.run(document_service.update_document(document_id, {"status": "failed"}))
+        raise e
+
 @celery_app.task(name="workers.tasks.daily_review_queue_task")
 def daily_review_queue_task():
     """
@@ -89,14 +111,3 @@ def daily_review_queue_task():
         return {"status": "error", "message": str(e)}
 
     return {"status": "success", "items_queued": queued_count, "processed_at": now_iso}
-
-@celery_app.task(name="workers.tasks.generate_video_task")
-def generate_video_task(doc_id: str, title: str, summary_sections: list):
-    """
-    Background worker task to generate narrated video lessons.
-    """
-    try:
-        video_path = asyncio.run(video_service.generate_video_lesson(doc_id, title, summary_sections))
-        return {"status": "success", "doc_id": doc_id, "video_path": video_path}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}

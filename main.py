@@ -29,7 +29,7 @@ from services.ollama_service import ollama_service
 from services.tts_service import tts_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
-from workers.tasks import process_document_task, summarize_document_task, generate_quiz_task, daily_review_queue_task
+from workers.tasks import process_document_task, summarize_document_task, generate_quiz_task, generate_video_task, daily_review_queue_task
 
 app = FastAPI(
     title="Focusly Backend API",
@@ -366,6 +366,66 @@ async def get_upcoming_reviews(
     """Returns upcoming reviews for the next N days (default 7 days)."""
     return await review_service.get_upcoming_reviews(user["user_id"], days=days)
 
+# --- Video Lesson Endpoints ---
+
+@app.post("/api/documents/{document_id}/generate-video")
+@app.post("/videos/generate/{document_id}")
+async def generate_video(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Triggers video lesson generation task."""
+    quota_ok = await video_service.check_user_video_quota(user["user_id"])
+    if not quota_ok:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Monthly video quota exceeded (10/month)")
+
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    try:
+        task = generate_video_task.delay(document_id)
+        task_id = task.id
+    except Exception:
+        task_id = str(uuid.uuid4())
+        await video_service.generate_video_lesson(document_id)
+
+    return {"task_id": task_id, "document_id": document_id, "status": "processing"}
+
+@app.get("/api/documents/{document_id}/video-status")
+async def get_document_video_status(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns current video generation status ('processing', 'ready', 'video_ready', or 'failed')."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    doc_status = doc.get("status", "processing")
+    video_state = "ready" if doc_status == "video_ready" else doc_status
+    return {"document_id": document_id, "status": video_state, "raw_status": doc_status}
+
+@app.get("/api/documents/{document_id}/video")
+async def get_document_video_url(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns public video URL if lesson video is ready."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    video_url = await video_service.get_video_url(document_id)
+    if not video_url:
+        if doc.get("status") == "video_ready" and doc.get("file_url"):
+            video_url = doc.get("file_url")
+
+    if not video_url:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not ready for this document")
+
+    return {"document_id": document_id, "video_url": video_url, "status": "video_ready"}
+
 # Legacy Quiz compatibility endpoints
 @app.post("/quizzes/generate/{document_id}", response_model=List[Dict[str, Any]])
 async def legacy_generate_quiz(
@@ -389,27 +449,6 @@ async def legacy_submit_quiz_attempt(
         user["user_id"], attempt.question_id, attempt.selected_answer, attempt.confidence_score
     )
     return res
-
-# --- Video Lesson Endpoints ---
-
-@app.post("/videos/generate/{document_id}", response_model=Dict[str, Any])
-async def generate_video(
-    document_id: str,
-    user: Dict[str, Any] = Depends(get_current_user)
-):
-    quota_ok = await video_service.check_user_video_quota(user["user_id"])
-    if not quota_ok:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Monthly video quota exceeded (10/month)")
-
-    doc = await document_service.get_document(document_id, user["user_id"])
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
-    sections = [
-        {"title": doc.get("filename", "Lesson"), "key_points": ["Key concept overview"], "explanation": doc.get("extracted_text", "")[:300]}
-    ]
-    video_path = await video_service.generate_video_lesson(document_id, doc.get("filename", "Lesson"), sections)
-    return {"document_id": document_id, "status": "video_ready", "video_path": video_path}
 
 # --- Study Plan Endpoints ---
 

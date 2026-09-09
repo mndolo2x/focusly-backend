@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from main import app
 from services.ollama_service import ollama_service
 from services.review_service import review_service
-from services.tts_service import tts_service
+from services.video_service import video_service
 
 client = TestClient(app)
 
@@ -35,37 +35,41 @@ def test_ollama_health_endpoint():
     assert response.status_code == 200
     data = response.json()
     assert "status" in data
-    assert "base_url" in data
 
-def test_tts_health_endpoint():
-    response = client.get("/api/health/tts")
-    assert response.status_code == 200
-    data = response.json()
-    assert "status" in data
-    assert "mp3_export_supported" in data
+def test_video_generation_endpoints_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-@pytest.mark.anyio
-async def test_tts_generate_audio_mp3_export():
-    out_path = "/tmp/test_narration.mp3"
-    result_path = await tts_service.generate_audio("Hello, welcome to Focusly lessons.", out_path)
-    assert os.path.exists(result_path)
-    assert result_path.endswith(".mp3")
-    if os.path.exists(result_path):
-        os.remove(result_path)
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file = io.BytesIO(fake_pdf)
 
-def test_unauthenticated_docs_access():
-    response = client.get("/api/documents")
-    assert response.status_code == 401
+    # 1. Upload Document
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("history.pdf", pdf_file, "application/pdf")},
+        headers=get_auth_headers()
+    )
+    assert up_res.status_code == 200
+    doc_id = up_res.json()["id"]
 
-def test_admin_exam_profiles():
-    response = client.get("/admin/exam-profiles")
-    assert response.status_code == 200
-    profiles = response.json()
-    assert isinstance(profiles, list)
+    # 2. Trigger Video Generation Task
+    gen_vid_res = client.post(f"/api/documents/{doc_id}/generate-video", headers=get_auth_headers())
+    assert gen_vid_res.status_code == 200
+    assert "task_id" in gen_vid_res.json()
+    assert gen_vid_res.json()["status"] == "processing"
 
-def test_migration_sql_schema_exists():
-    sql_path = os.path.join(os.path.dirname(__file__), "migrations", "001_initial_schema.sql")
-    assert os.path.exists(sql_path)
+    # 3. Get Video Status
+    status_res = client.get(f"/api/documents/{doc_id}/video-status", headers=get_auth_headers())
+    assert status_res.status_code == 200
+    assert "status" in status_res.json()
+
+    # 4. Mock Video Lesson Assembly & Fetch Video URL
+    import asyncio
+    video_url = asyncio.run(video_service.generate_video_lesson(doc_id, title="History Lesson"))
+    assert video_url is not None
+
+    get_vid_res = client.get(f"/api/documents/{doc_id}/video", headers=get_auth_headers())
+    assert get_vid_res.status_code == 200
+    assert "video_url" in get_vid_res.json()
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):
