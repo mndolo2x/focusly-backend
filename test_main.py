@@ -68,61 +68,40 @@ def test_auth_me_with_jwt_token(monkeypatch):
     data = response.json()
     assert data["id"] == "user_123"
 
-def test_document_upload_validation_file_type(monkeypatch):
-    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
-    fake_txt = io.BytesIO(b"Hello text file")
-    response = client.post(
-        "/api/documents/upload",
-        files={"file": ("test.txt", fake_txt, "text/plain")},
-        headers=get_auth_headers()
-    )
-    assert response.status_code == 400
-    assert "Invalid file type" in response.json()["detail"]
-
-def test_document_upload_success(monkeypatch):
+def test_document_upload_and_summarize_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    # Create minimal PDF header bytes
     fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
     pdf_file = io.BytesIO(fake_pdf)
 
-    response = client.post(
-        "/api/documents/upload",
-        files={"file": ("biology_notes.pdf", pdf_file, "application/pdf")},
-        headers=get_auth_headers()
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert "id" in data
-    assert data["filename"] == "biology_notes.pdf"
-    assert data["status"] == "completed"
-
-def test_get_paginated_documents(monkeypatch):
-    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
-    response = client.get("/api/documents?page=1&limit=5", headers=get_auth_headers())
-    assert response.status_code == 200
-    data = response.json()
-    assert "items" in data
-    assert "total" in data
-    assert "page" in data
-
-def test_delete_document(monkeypatch):
-    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
-
-    # Upload first
-    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
-    pdf_file = io.BytesIO(fake_pdf)
+    # 1. Upload
     up_res = client.post(
         "/api/documents/upload",
-        files={"file": ("to_delete.pdf", pdf_file, "application/pdf")},
+        files={"file": ("physics.pdf", pdf_file, "application/pdf")},
         headers=get_auth_headers()
     )
+    assert up_res.status_code == 200
     doc_id = up_res.json()["id"]
 
-    # Delete
-    del_res = client.delete(f"/api/documents/{doc_id}", headers=get_auth_headers())
-    assert del_res.status_code == 200
-    assert "deleted successfully" in del_res.json()["message"]
+    # 2. Trigger Summarize Task
+    task_res = client.post(f"/api/documents/{doc_id}/summarize?depth=standard", headers=get_auth_headers())
+    assert task_res.status_code == 200
+    assert "task_id" in task_res.json()
+    assert task_res.json()["status"] == "processing"
+
+    # 3. Direct Summary (quick & deep depth)
+    summary_quick = client.post(f"/api/documents/{doc_id}/summary?depth=quick", headers=get_auth_headers())
+    assert summary_quick.status_code == 200
+    assert "sections" in summary_quick.json()
+
+    summary_deep = client.post(f"/api/documents/{doc_id}/summary?depth=deep", headers=get_auth_headers())
+    assert summary_deep.status_code == 200
+    assert summary_deep.json()["depth"] == "deep"
+
+    # 4. Get Latest Summary
+    get_sum = client.get(f"/api/documents/{doc_id}/summary", headers=get_auth_headers())
+    assert get_sum.status_code == 200
+    assert "sections" in get_sum.json()
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

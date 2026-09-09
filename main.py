@@ -1,5 +1,6 @@
 import os
 import shutil
+import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Depends, File, UploadFile, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +27,7 @@ from services.study_service import study_service
 from services.ollama_service import ollama_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
-from workers.tasks import process_document_task
+from workers.tasks import process_document_task, summarize_document_task
 
 app = FastAPI(
     title="Focusly Backend API",
@@ -79,7 +80,6 @@ async def upload_document(
     """
     user_id = user["user_id"]
 
-    # 1. Validate File Extension / Mimetype
     filename = file.filename or "uploaded.pdf"
     if not (filename.lower().endswith(".pdf") or file.content_type in ["application/pdf", "octet-stream"]):
         raise HTTPException(
@@ -87,7 +87,6 @@ async def upload_document(
             detail="Invalid file type. Only PDF documents are allowed."
         )
 
-    # Read content to validate file size
     file_bytes = await file.read()
     if len(file_bytes) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(
@@ -95,21 +94,17 @@ async def upload_document(
             detail=f"File size exceeds maximum allowed limit of 50MB ({len(file_bytes)} bytes)."
         )
 
-    # 2. Upload File to Supabase Storage
     file_url = await document_service.upload_file_to_storage(file_bytes, filename, user_id)
 
-    # Save to local temporary path for extraction processing
     upload_dir = "/tmp/focusly_uploads"
     os.makedirs(upload_dir, exist_ok=True)
     local_file_path = os.path.join(upload_dir, f"{user_id}_{filename}")
     with open(local_file_path, "wb") as buffer:
         buffer.write(file_bytes)
 
-    # 3. Create initial document record in database with status='processing'
     doc_record = await document_service.create_document_record(user_id, filename, file_url)
     doc_id = doc_record["id"]
 
-    # 4. Extract Text & Page Count (PyMuPDF with page tracking -> Tesseract OCR -> pdfplumber)
     try:
         extracted_text, page_count = text_extractor.extract_text_and_page_count(local_file_path)
         doc_record = await document_service.update_document(
@@ -121,7 +116,7 @@ async def upload_document(
                 "file_url": file_url
             }
         )
-        rag_engine.index_document(doc_id, extracted_text)
+        await rag_engine.index_document_chunks(doc_id, extracted_text)
     except Exception as e:
         doc_record = await document_service.update_document(doc_id, {"status": "failed"})
         raise HTTPException(
@@ -161,21 +156,76 @@ async def delete_document(document_id: str, user: Dict[str, Any] = Depends(get_c
 
 # --- Summary Endpoints ---
 
-@app.post("/summaries", response_model=Dict[str, Any])
-async def create_summary(
-    payload: SummaryCreate,
+@app.post("/api/documents/{document_id}/summarize")
+async def trigger_summarize_task(
+    document_id: str,
+    depth: str = Query("standard", regex="^(quick|standard|deep)$"),
     user: Dict[str, Any] = Depends(get_current_user)
 ):
+    """Triggers Celery background task to summarize document with FAISS source tracking."""
     quota_ok = await summary_service.check_user_summary_quota(user["user_id"])
     if not quota_ok:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Monthly summary quota exceeded (50/month)")
 
-    doc = await document_service.get_document(payload.document_id, user["user_id"])
+    doc = await document_service.get_document(document_id, user["user_id"])
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
+    try:
+        task = summarize_document_task.delay(document_id, depth=depth)
+        task_id = task.id
+    except Exception:
+        # Inline execution fallback if Celery broker offline
+        task_id = str(uuid.uuid4())
+        text = doc.get("extracted_text", "")
+        await rag_engine.index_document_chunks(document_id, text)
+        await summary_service.generate_summary_for_text(document_id, text, depth=depth)
+
+    return {"task_id": task_id, "document_id": document_id, "status": "processing", "depth": depth}
+
+@app.get("/api/documents/{document_id}/summary")
+async def get_latest_document_summary(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns the most recent summary for a specific document."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    summary = await summary_service.get_latest_summary(document_id)
+    if not summary:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No summary found for this document")
+
+    return summary
+
+@app.post("/api/documents/{document_id}/summary")
+@app.post("/summaries", response_model=Dict[str, Any])
+async def create_summary(
+    document_id: Optional[str] = None,
+    payload: Optional[SummaryCreate] = None,
+    depth: str = Query("standard", regex="^(quick|standard|deep)$"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Generates concise or comprehensive summary directly based on depth query parameter."""
+    target_doc_id = document_id or (payload.document_id if payload else None)
+    if not target_doc_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing document_id")
+
+    quota_ok = await summary_service.check_user_summary_quota(user["user_id"])
+    if not quota_ok:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Monthly summary quota exceeded (50/month)")
+
+    doc = await document_service.get_document(target_doc_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if payload and hasattr(payload, 'depth') and payload.depth:
+        depth = payload.depth.value if hasattr(payload.depth, 'value') else str(payload.depth)
+
     text = doc.get("extracted_text", "")
-    summary = await summary_service.generate_summary(payload.document_id, text, payload.depth)
+    await rag_engine.index_document_chunks(target_doc_id, text)
+    summary = await summary_service.generate_summary_for_text(target_doc_id, text, depth=depth)
     return summary
 
 # --- Quiz Endpoints ---
