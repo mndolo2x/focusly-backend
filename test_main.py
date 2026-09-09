@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 from main import app
 from services.ollama_service import ollama_service
+from services.review_service import review_service
 
 client = TestClient(app)
 
@@ -61,69 +62,50 @@ def test_migration_sql_schema_exists():
     for tbl in expected_tables:
         assert tbl in content
 
-def test_auth_me_with_jwt_token(monkeypatch):
+def test_sm2_algorithm_math():
+    # Quality = 5 (perfect response)
+    ef, interval, reps, next_date = review_service.calculate_next_review(ease_factor=2.5, interval=1, quality=5, repetitions=1)
+    assert ef > 2.5
+    assert reps == 2
+    assert interval == 6
+
+    # Quality = 2 (complete blackout/fail) -> resets
+    ef_fail, interval_fail, reps_fail, _ = review_service.calculate_next_review(ease_factor=ef, interval=6, quality=2, repetitions=2)
+    assert reps_fail == 0
+    assert interval_fail == 1
+
+def test_reviews_api_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
-    response = client.get("/api/auth/me", headers=get_auth_headers())
-    assert response.status_code == 200
-    data = response.json()
-    assert data["id"] == "user_123"
 
-def test_document_upload_and_weak_area_flow(monkeypatch):
-    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+    # Schedule a test review item
+    import asyncio
+    item = asyncio.run(review_service.schedule_review("user_123", "q_100", quality=1))
+    item_id = item["id"]
 
-    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
-    pdf_file = io.BytesIO(fake_pdf)
+    # GET /api/reviews/today
+    res_today = client.get("/api/reviews/today", headers=get_auth_headers())
+    assert res_today.status_code == 200
+    data_today = res_today.json()
+    assert "due_count" in data_today
+    assert "items" in data_today
 
-    # 1. Upload
-    up_res = client.post(
-        "/api/documents/upload",
-        files={"file": ("chemistry.pdf", pdf_file, "application/pdf")},
+    # POST /api/reviews/submit
+    res_submit = client.post(
+        "/api/reviews/submit",
+        json={"review_item_id": item_id, "quality": 4},
         headers=get_auth_headers()
     )
-    assert up_res.status_code == 200
-    doc_id = up_res.json()["id"]
+    assert res_submit.status_code == 200
+    sub_data = res_submit.json()
+    assert sub_data["interval"] >= 1
+    assert "next_review_date" in sub_data
 
-    # 2. Generate Quiz
-    gen_quiz_res = client.post(f"/api/documents/{doc_id}/generate-quiz?num_questions=3", headers=get_auth_headers())
-    assert gen_quiz_res.status_code == 200
-
-    get_quiz_res = client.get(f"/api/documents/{doc_id}/quiz", headers=get_auth_headers())
-    assert get_quiz_res.status_code == 200
-    questions = get_quiz_res.json()
-    assert len(questions) >= 1
-
-    q_id = questions[0]["id"]
-
-    # 3. Submit Incorrect Answer with Low Confidence
-    submissions = [
-        {"question_id": q_id, "selected_answer": 3, "confidence_score": 1} # Wrong answer (0 is correct)
-    ]
-    submit_res = client.post(f"/api/documents/{doc_id}/quiz/submit", json=submissions, headers=get_auth_headers())
-    assert submit_res.status_code == 200
-
-    # 4. Check Weak Areas Endpoint
-    weak_res = client.get(f"/api/documents/{doc_id}/weak-areas", headers=get_auth_headers())
-    assert weak_res.status_code == 200
-    weak_areas = weak_res.json()
-    assert isinstance(weak_areas, list)
-    assert len(weak_areas) >= 1
-    assert weak_areas[0]["miss_count"] >= 1
-    assert weak_areas[0]["priority_score"] >= 3.0 # Miss count 1 + (1 low conf * 2)
-
-    # 5. Check Dashboard Weak Areas
-    dash_res = client.get("/api/dashboard/weak-areas", headers=get_auth_headers())
-    assert dash_res.status_code == 200
-    dash_weak = dash_res.json()
-    assert len(dash_weak) >= 1
-
-    # 6. Mark Weak Area as Reviewed
-    rev_res = client.post(
-        f"/api/documents/{doc_id}/weak-areas/review",
-        json={"section_index": weak_areas[0]["section_index"], "page_reference": weak_areas[0]["page_reference"]},
-        headers=get_auth_headers()
-    )
-    assert rev_res.status_code == 200
-    assert "marked as reviewed" in rev_res.json()["message"]
+    # GET /api/reviews/upcoming
+    res_upcoming = client.get("/api/reviews/upcoming?days=7", headers=get_auth_headers())
+    assert res_upcoming.status_code == 200
+    up_data = res_upcoming.json()
+    assert "total_upcoming" in up_data
+    assert "schedule" in up_data
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

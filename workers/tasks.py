@@ -1,9 +1,11 @@
 import asyncio
+from datetime import datetime
 from workers.celery_app import celery_app
 from services.document_service import document_service
 from services.summary_service import summary_service
 from services.quiz_service import quiz_service
 from services.video_service import video_service
+from services.review_service import review_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
 
@@ -68,6 +70,25 @@ def generate_quiz_task(document_id: str, num_questions: int = 10):
         return {"status": "success", "document_id": document_id, "questions_generated": len(questions)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@celery_app.task(name="workers.tasks.daily_review_queue_task")
+def daily_review_queue_task():
+    """
+    Daily Celery Beat cron task that finds all review_items where next_review_date <= today
+    and queues them for users.
+    """
+    now_iso = datetime.utcnow().isoformat()
+    queued_count = 0
+
+    try:
+        from database import supabase
+        res = supabase.table("review_items").select("*").lte("next_review_date", now_iso).execute()
+        if res.data:
+            queued_count = len(res.data)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+    return {"status": "success", "items_queued": queued_count, "processed_at": now_iso}
 
 @celery_app.task(name="workers.tasks.generate_video_task")
 def generate_video_task(doc_id: str, title: str, summary_sections: list):

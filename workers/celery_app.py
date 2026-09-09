@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 from config import settings
 
 celery_app = Celery(
@@ -13,4 +14,10 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    beat_schedule={
+        "daily-review-queue-cron": {
+            "task": "workers.tasks.daily_review_queue_task",
+            "schedule": crontab(hour=0, minute=0), # Run daily at midnight UTC
+        },
+    },
 )

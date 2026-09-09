@@ -22,12 +22,13 @@ from models import (
 from services.document_service import document_service
 from services.summary_service import summary_service
 from services.quiz_service import quiz_service
+from services.review_service import review_service
 from services.video_service import video_service
 from services.study_service import study_service
 from services.ollama_service import ollama_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
-from workers.tasks import process_document_task, summarize_document_task, generate_quiz_task
+from workers.tasks import process_document_task, summarize_document_task, generate_quiz_task, daily_review_queue_task
 
 app = FastAPI(
     title="Focusly Backend API",
@@ -322,6 +323,42 @@ async def get_dashboard_weak_areas(
 ):
     """Aggregates weak areas across ALL user documents, sorted by most-missed/priority score."""
     return await quiz_service.get_dashboard_weak_areas(user["user_id"])
+
+# --- Spaced Repetition Review Endpoints ---
+
+@app.get("/api/reviews/today")
+async def get_reviews_today(
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns questions due for spaced repetition review today."""
+    due_items = await review_service.get_due_reviews_today(user["user_id"])
+    return {"user_id": user["user_id"], "due_count": len(due_items), "items": due_items}
+
+@app.post("/api/reviews/submit")
+async def submit_review_item(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Accepts {review_item_id, quality (0-5)} and updates SM-2 parameters and next review date."""
+    review_item_id = payload.get("review_item_id")
+    quality = payload.get("quality", 3)
+
+    if not review_item_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing review_item_id")
+
+    if not isinstance(quality, int) or not (0 <= quality <= 5):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Quality score must be an integer between 0 and 5")
+
+    updated_item = await review_service.submit_review_item(user["user_id"], review_item_id, quality)
+    return updated_item
+
+@app.get("/api/reviews/upcoming")
+async def get_upcoming_reviews(
+    days: int = Query(7, ge=1, le=30),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns upcoming reviews for the next N days (default 7 days)."""
+    return await review_service.get_upcoming_reviews(user["user_id"], days=days)
 
 # Legacy Quiz compatibility endpoints
 @app.post("/quizzes/generate/{document_id}", response_model=List[Dict[str, Any]])
