@@ -85,6 +85,57 @@ def test_timed_exam_mode_flow(monkeypatch):
     assert "feedback" in grade_data
     assert grade_data["total_questions"] == 35
 
+def test_admin_comprehensive_endpoints_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # 1. List users
+    users_res = client.get("/api/admin/users", headers=get_auth_headers(is_admin=True))
+    assert users_res.status_code == 200
+    assert "users" in users_res.json()
+
+    # 2. Get user details
+    detail_res = client.get("/api/admin/users/user_123", headers=get_auth_headers(is_admin=True))
+    assert detail_res.status_code == 200
+    assert detail_res.json()["id"] == "user_123"
+
+    # 3. Toggle status
+    status_res = client.put(
+        "/api/admin/users/user_123/status",
+        json={"status": "suspended", "reason": "Terms of service violation"},
+        headers=get_auth_headers(is_admin=True)
+    )
+    assert status_res.status_code == 200
+    assert status_res.json()["account_status"] == "suspended"
+
+    # 4. Aggregate usage stats
+    usage_res = client.get("/api/admin/usage", headers=get_auth_headers(is_admin=True))
+    assert usage_res.status_code == 200
+    assert "aggregate" in usage_res.json()
+
+    # 5. List documents with filter
+    docs_res = client.get("/api/admin/documents?status_filter=completed", headers=get_auth_headers(is_admin=True))
+    assert docs_res.status_code == 200
+    assert "documents" in docs_res.json()
+
+    # 6. Admin delete document
+    del_res = client.delete("/api/admin/documents/doc_admin_999", headers=get_auth_headers(is_admin=True))
+    assert del_res.status_code == 200
+    assert "deleted by admin override" in del_res.json()["message"]
+
+    # 7. System logs
+    logs_res = client.get("/api/admin/logs", headers=get_auth_headers(is_admin=True))
+    assert logs_res.status_code == 200
+    assert "logs" in logs_res.json()
+
+    # 8. Maintenance cleanup
+    cleanup_res = client.post("/api/admin/maintenance/cleanup", headers=get_auth_headers(is_admin=True))
+    assert cleanup_res.status_code == 200
+    assert "Maintenance cleanup completed successfully" in cleanup_res.json()["message"]
+
+    # 9. Non-admin forbidden check
+    forbidden_res = client.get("/api/admin/users", headers=get_auth_headers(is_admin=False))
+    assert forbidden_res.status_code == 403
+
 def test_user_usage_and_quota_enforcement(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 

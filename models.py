@@ -311,6 +311,17 @@ class AdminUsageAdjustRequest(BaseModel):
     video_generations_limit: Optional[int] = None
     summary_generations_limit: Optional[int] = None
 
+class AdminUserStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(active|suspended)$")
+    reason: Optional[str] = None
+
+class AdminSystemLogItem(BaseModel):
+    timestamp: datetime
+    level: str
+    component: str
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
 class SharedLinkCreate(BaseModel):
     document_id: Optional[str] = None
     expires_in_days: Optional[int] = 7
