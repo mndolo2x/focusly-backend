@@ -13,7 +13,7 @@ class SummaryService:
     """Service for generating and storing AI summaries using Ollama and FAISS RAG indexing."""
 
     async def check_user_summary_quota(self, user_id: str) -> bool:
-        """Verifies if user has remaining summary generations for current month."""
+        """Verifies if user has remaining summary generations for current month (max 50/month)."""
         try:
             res = supabase.table("user_usage").select("summary_generations_used").eq("user_id", user_id).execute()
             if res.data and res.data[0].get("summary_generations_used", 0) >= 50:
@@ -21,6 +21,16 @@ class SummaryService:
         except Exception:
             pass
         return True
+
+    async def increment_summary_usage(self, user_id: str) -> None:
+        """Increments summary_generations_used counter for user in user_usage table."""
+        try:
+            res = supabase.table("user_usage").select("summary_generations_used").eq("user_id", user_id).execute()
+            if res.data:
+                curr = res.data[0].get("summary_generations_used", 0)
+                supabase.table("user_usage").update({"summary_generations_used": curr + 1}).eq("user_id", user_id).execute()
+        except Exception:
+            pass
 
     async def generate_summary_for_text(self, document_id: str, text: str, depth: str = "standard") -> Dict[str, Any]:
         """

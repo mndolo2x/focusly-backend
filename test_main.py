@@ -85,6 +85,50 @@ def test_timed_exam_mode_flow(monkeypatch):
     assert "feedback" in grade_data
     assert grade_data["total_questions"] == 35
 
+def test_user_usage_and_quota_enforcement(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # 1. Get user usage
+    res = client.get("/api/user/usage", headers=get_auth_headers())
+    assert res.status_code == 200
+    data = res.json()
+    assert "user_id" in data
+    assert data["video_generations_limit"] == 10
+    assert data["summary_generations_limit"] == 50
+    assert "next_reset_date" in data
+    assert "X-AI-Disclaimer" in res.headers
+
+    # 2. Check 429 quota enforcement for summary when over limit
+    async def mock_over_quota_summary(user_id):
+        return False
+
+    monkeypatch.setattr("services.summary_service.summary_service.check_user_summary_quota", mock_over_quota_summary)
+
+    # Upload document first
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("quota_test.pdf", io.BytesIO(fake_pdf), "application/pdf")},
+        headers=get_auth_headers()
+    )
+    doc_id = up_res.json()["id"]
+
+    sum_res = client.post(
+        f"/api/documents/{doc_id}/summarize",
+        headers=get_auth_headers()
+    )
+    assert sum_res.status_code == 429
+    assert "quota exceeded" in sum_res.json()["detail"].lower()
+
+    # 3. Admin usage adjustment
+    admin_res = client.put(
+        "/api/admin/users/user_123/usage",
+        json={"summary_generations_used": 0, "video_generations_used": 0},
+        headers=get_auth_headers(is_admin=True)
+    )
+    assert admin_res.status_code == 200
+    assert "adjusted successfully" in admin_res.json()["message"]
+
 def test_public_share_links_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 

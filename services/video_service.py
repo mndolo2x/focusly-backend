@@ -23,6 +23,16 @@ class VideoService:
             pass
         return True
 
+    async def increment_video_usage(self, user_id: str) -> None:
+        """Increments video_generations_used counter for user in user_usage table."""
+        try:
+            res = supabase.table("user_usage").select("video_generations_used").eq("user_id", user_id).execute()
+            if res.data:
+                curr = res.data[0].get("video_generations_used", 0)
+                supabase.table("user_usage").update({"video_generations_used": curr + 1}).eq("user_id", user_id).execute()
+        except Exception:
+            pass
+
     def _format_timestamp_vtt(self, seconds: float) -> str:
         """Formats seconds into WebVTT timestamp format HH:MM:SS.mmm."""
         hrs = int(seconds // 3600)

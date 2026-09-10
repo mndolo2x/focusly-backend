@@ -14,6 +14,12 @@ try:
 except ImportError:
     easyocr = None
 
+try:
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+except ImportError:
+    TrOCRProcessor = None
+    VisionEncoderDecoderModel = None
+
 from services.ollama_service import ollama_service
 from utils.image_preprocessor import image_preprocessor
 
@@ -28,6 +34,8 @@ class HandwritingOCR:
 
     def __init__(self):
         self._easyocr_reader = None
+        self._trocr_processor = None
+        self._trocr_model = None
 
     def _get_easyocr_reader(self):
         if self._easyocr_reader is None and easyocr is not None:
@@ -36,6 +44,15 @@ class HandwritingOCR:
             except Exception:
                 pass
         return self._easyocr_reader
+
+    def _get_trocr_components(self):
+        if self._trocr_processor is None and TrOCRProcessor is not None:
+            try:
+                self._trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten")
+                self._trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-handwritten")
+            except Exception:
+                pass
+        return self._trocr_processor, self._trocr_model
 
     def encode_image_base64(self, img: Image.Image) -> str:
         """Converts PIL image to base64 JPEG string for vision model input."""
@@ -75,10 +92,26 @@ class HandwritingOCR:
             pass
         return None
 
-    def tier2_easyocr(self, img: Image.Image) -> Optional[Dict[str, Any]]:
+    def tier2_neural_ocr(self, img: Image.Image) -> Optional[Dict[str, Any]]:
         """
-        Tier 2: EasyOCR / TrOCR fallback.
+        Tier 2: TrOCR (microsoft/trocr-base-handwritten) with EasyOCR fallback.
         """
+        processor, model = self._get_trocr_components()
+        if processor is not None and model is not None:
+            try:
+                pixel_values = processor(images=img.convert("RGB"), return_tensors="pt").pixel_values
+                generated_ids = model.generate(pixel_values)
+                generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+                if generated_text:
+                    return {
+                        "text": generated_text,
+                        "confidence": 0.85,
+                        "tier": "trocr-handwritten",
+                        "diagrams_found": False
+                    }
+            except Exception:
+                pass
+
         reader = self._get_easyocr_reader()
         if not reader:
             return None
@@ -167,8 +200,8 @@ class HandwritingOCR:
             confidence = t1_res["confidence"]
             ocr_tier = t1_res["tier"]
         else:
-            # Attempt Tier 2: EasyOCR
-            t2_res = self.tier2_easyocr(processed_pil)
+            # Attempt Tier 2: TrOCR / EasyOCR
+            t2_res = self.tier2_neural_ocr(processed_pil)
             if t2_res and t2_res.get("text") and len(t2_res["text"].strip()) > 5:
                 extracted_text = t2_res["text"]
                 confidence = t2_res["confidence"]

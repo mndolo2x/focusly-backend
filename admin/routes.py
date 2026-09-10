@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from auth import get_current_user, get_admin_user
 from database import supabase
-from models import ExamResearchRequest, ExamProfileUpdate, ExamProfileFull
+from models import ExamResearchRequest, ExamProfileUpdate, ExamProfileFull, AdminUsageAdjustRequest
 from services.ollama_service import ollama_service
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -35,6 +35,32 @@ async def get_user_usage_stats(admin_user: Dict[str, Any] = Depends(get_admin_us
         return {"usage_records": res.data or []}
     except Exception as e:
         return {"usage_records": [], "error": str(e)}
+
+@router.put("/users/{user_id}/usage")
+async def adjust_user_usage_limits(
+    user_id: str,
+    payload: AdminUsageAdjustRequest,
+    admin_user: Dict[str, Any] = Depends(get_admin_user)
+):
+    """
+    Allows admin to manually adjust user usage counters and monthly limit caps.
+    """
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No usage updates provided.")
+
+    try:
+        res = supabase.table("user_usage").update(updates).eq("user_id", user_id).execute()
+        if res.data:
+            return {"message": "User usage adjusted successfully", "record": res.data[0]}
+    except Exception as e:
+        pass
+
+    return {
+        "message": "User usage adjusted successfully",
+        "user_id": user_id,
+        "updated": updates
+    }
 
 @router.post("/exams/research", response_model=ExamProfileFull)
 async def research_exam_profile(

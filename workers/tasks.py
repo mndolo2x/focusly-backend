@@ -114,6 +114,27 @@ def generate_video_task(document_id: str):
         asyncio.run(document_service.update_document(document_id, {"status": "failed"}))
         raise e
 
+@celery_app.task(name="workers.tasks.reset_monthly_usage_task")
+def reset_monthly_usage_task():
+    """
+    Monthly Celery Beat cron task executed on the 1st of every month at 00:00 UTC.
+    Resets video_generations_used, summary_generations_used, and quiz_generations_used to 0 for all users.
+    """
+    now = datetime.utcnow()
+    try:
+        from database import supabase
+        res = supabase.table("user_usage").update({
+            "video_generations_used": 0,
+            "summary_generations_used": 0,
+            "quiz_generations_used": 0,
+            "month": now.month,
+            "year": now.year
+        }).neq("id", "00000000-0000-0000-0000-000000000000").execute()
+        reset_count = len(res.data) if res.data else 0
+        return {"status": "success", "users_reset": reset_count, "month": now.month, "year": now.year}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @celery_app.task(name="workers.tasks.daily_review_queue_task")
 def daily_review_queue_task():
     """
