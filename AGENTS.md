@@ -8,7 +8,7 @@ Focusly is a learning platform that converts PDF uploads into AI-generated summa
 - **Database**: Supabase (PostgreSQL)
 - **Auth**: Supabase Auth
 - **Background Tasks**: Celery + Redis
-- **Local AI**: Ollama + Llama 3.1 8B (primary model)
+- **AI Service**: Google Gemini API (gemini-1.5-flash primary text/vision model)
 - **Text-to-Speech**: Kokoro TTS (open-source, runs locally)
 - **Video Assembly**: FFmpeg + Pillow
 - **OCR**: Tesseract (for scanned PDFs)
@@ -17,7 +17,7 @@ Focusly is a learning platform that converts PDF uploads into AI-generated summa
 
 ## Core Principle: 100% Local AI
 - NO external API calls to OpenAI, Claude, or any cloud AI service
-- All AI processing uses Ollama running locally
+- All AI processing uses Google Gemini API via secure backend service
 - All TTS uses Kokoro running locally
 - All video assembly uses FFmpeg locally
 

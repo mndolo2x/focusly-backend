@@ -10,7 +10,7 @@ PyMuPDF
 pytesseract
 pdfplumber
 pillow
-ollama
+google-generativeai
 kokoro-tts
 ffmpeg-python
 faiss-cpu

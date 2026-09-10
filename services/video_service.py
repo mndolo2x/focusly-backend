@@ -41,6 +41,39 @@ class VideoService:
         millis = int(round((seconds - int(seconds)) * 1000))
         return f"{hrs:02d}:{mins:02d}:{secs:02d}.{millis:03d}"
 
+    async def generate_lesson_script(
+        self, document_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Generates structured lesson scripts (narration, visual cues, captions, quiz checkpoints) using Gemini.
+        Separates script generation from media assembly.
+        """
+        summary = await summary_service.get_latest_summary(document_id)
+        sections = summary.get("sections", []) if summary else []
+
+        from services.gemini_service import gemini_service
+        import json
+
+        prompt = (
+            f"Generate a structured video lesson script for the following study material.\n"
+            f"Output JSON Format:\n"
+            f'{{"script_sections": [{{"section_title": "...", "narration_text": "...", "visual_cue": "...", "quiz_checkpoint": "...", "page_number": 1}}]}}\n\n'
+            f"Summary Content:\n{json.dumps(sections)}"
+        )
+        system = "You are an expert educational video scriptwriter producing clean, engaging lesson scripts."
+
+        try:
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
+            return data.get("script_sections", [])
+        except Exception:
+            return [{
+                "section_title": "Introduction",
+                "narration_text": "Welcome to this AI-narrated study lesson.",
+                "visual_cue": "Display title slide and overview bullets.",
+                "quiz_checkpoint": "What is the main topic of this lesson?",
+                "page_number": 1
+            }]
+
     async def generate_video_lesson(
         self, document_id: str, title: Optional[str] = None, summary_sections: Optional[List[Dict[str, Any]]] = None, output_dir: str = "/tmp/videos"
     ) -> str:

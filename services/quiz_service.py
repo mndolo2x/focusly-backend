@@ -1,7 +1,7 @@
 import uuid
 from typing import Any, Dict, List, Optional
 from database import supabase
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 from services.summary_service import summary_service
 
 # In-memory stores for unit tests / local fallback
@@ -41,7 +41,7 @@ class QuizService:
         system = "You are an AI quiz generator. Create clear, challenging multiple choice questions for high school students."
 
         try:
-            data = await ollama_service.generate_json(prompt, system_prompt=system)
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
             raw_questions = data.get("questions", [])
         except Exception:
             raw_questions = []
@@ -96,6 +96,37 @@ class QuizService:
     async def generate_quiz_questions(self, document_id: str, text: str, count: int = 5) -> List[Dict[str, Any]]:
         """Backwards compatibility wrapper."""
         return await self.generate_quiz_from_summary(document_id, num_questions=count)
+
+    async def generate_flashcards(
+        self, document_id: str, num_cards: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Generates structured flashcards (question, answer, explanation, topic, difficulty, sources) using Gemini.
+        """
+        summary = await summary_service.get_latest_summary(document_id)
+        sections = summary.get("sections", []) if summary else []
+
+        prompt = (
+            f"Generate {num_cards} flashcards from this study summary.\n"
+            f"Output JSON Format:\n"
+            f'{{"flashcards": [{{"question": "...", "answer": "...", "explanation": "...", "topic": "...", "difficulty": "medium", "sources": [{{"document_id": "{document_id}", "page": 1}}]}}]}}\n\n'
+            f"Summary Content:\n{json.dumps(sections)}"
+        )
+        system = "You are an AI study aid generator producing structured flashcards for students."
+
+        try:
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
+            cards = data.get("flashcards", [])
+            return cards
+        except Exception:
+            return [{
+                "question": "What is the key takeaway of this document?",
+                "answer": "Review the summary sections for detailed concepts.",
+                "explanation": "Summary highlights core concepts.",
+                "topic": "General Overview",
+                "difficulty": "easy",
+                "sources": [{"document_id": document_id, "page": 1}]
+            }]
 
     async def get_quiz_questions(self, document_id: str) -> List[Dict[str, Any]]:
         """Retrieves all quiz questions for a document."""

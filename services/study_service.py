@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 from typing import Any, Dict, List, Optional
 from database import supabase
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 from services.document_service import document_service
 from services.quiz_service import quiz_service
 from services.review_service import review_service
@@ -45,7 +45,7 @@ class StudyService:
         system = "You are an AI exam generator creating formal, high-stakes timed tests for high school students."
 
         try:
-            data = await ollama_service.generate_json(prompt, system_prompt=system)
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
             raw_qs = data.get("questions", [])
         except Exception:
             raw_qs = []
@@ -313,7 +313,7 @@ class StudyService:
         system = "You are an expert AI academic study planner helping students prepare for high-stakes exams."
 
         try:
-            data = await ollama_service.generate_json(prompt, system_prompt=system)
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
             raw_schedule = data.get("schedule", [])
         except Exception:
             raw_schedule = []
@@ -438,6 +438,27 @@ class StudyService:
     async def generate_study_plan(self, user_id: str, exam_date: datetime, document_ids: List[str]) -> Dict[str, Any]:
         """Backwards compatibility wrapper."""
         return await self.create_ai_study_plan(user_id, exam_date, subject="General Exam", document_ids=document_ids)
+
+    async def ask_focusly_question(
+        self, user_id: str, question: str, document_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Processes Ask Focusly Q&A request grounded in document text and student history.
+        """
+        context_text = None
+        if document_id:
+            doc = await document_service.get_document(document_id, user_id)
+            if doc:
+                context_text = doc.get("extracted_text")
+
+        weak_areas = await quiz_service.get_dashboard_weak_areas(user_id)
+
+        from services.gemini_service import gemini_service
+        return await gemini_service.ask_focusly(
+            question=question,
+            context_text=context_text,
+            student_history=weak_areas
+        )
 
     async def get_dashboard_progress(self, user_id: str) -> Dict[str, Any]:
         """
@@ -576,7 +597,7 @@ class StudyService:
         system = f"You are an expert exam board question writer for {exam_name}. Create accurate, challenging practice questions."
 
         try:
-            data = await ollama_service.generate_json(prompt, system_prompt=system)
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
             raw_qs = data.get("questions", [])
         except Exception:
             raw_qs = []

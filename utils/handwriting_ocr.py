@@ -20,7 +20,7 @@ except ImportError:
     TrOCRProcessor = None
     VisionEncoderDecoderModel = None
 
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 from utils.image_preprocessor import image_preprocessor
 
 
@@ -62,10 +62,9 @@ class HandwritingOCR:
 
     async def tier1_vision_llm(self, img: Image.Image) -> Optional[Dict[str, Any]]:
         """
-        Tier 1: Query llama3.2-vision:11b on local Ollama server.
+        Tier 1: Query Gemini Vision model.
         Asks vision model to transcribe handwritten text and extract diagrams with [DIAGRAM: ...] tags.
         """
-        base64_str = self.encode_image_base64(img)
         prompt = (
             "Transcribe all handwritten text in this image accurately into clean Markdown text.\n"
             "If you see any drawn diagrams, flowcharts, or formulas, represent them inline using structured text tags like:\n"
@@ -74,18 +73,17 @@ class HandwritingOCR:
         )
 
         try:
-            response = await ollama_service.generate_with_image(
+            response = await gemini_service.generate_with_image(
                 prompt=prompt,
-                image_base64=base64_str,
-                model="llama3.2-vision:11b"
+                image_input=img
             )
             if response and response.get("response"):
                 text = response["response"].strip()
                 if len(text) > 10:
                     return {
                         "text": text,
-                        "confidence": 0.92,
-                        "tier": "llama3.2-vision",
+                        "confidence": 0.95,
+                        "tier": "gemini-vision",
                         "diagrams_found": bool(re.search(r'\[DIAGRAM:.*?\]', text, re.IGNORECASE))
                     }
         except Exception:

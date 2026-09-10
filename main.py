@@ -55,7 +55,7 @@ from services.quiz_service import quiz_service
 from services.review_service import review_service
 from services.video_service import video_service
 from services.study_service import study_service
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 from services.tts_service import tts_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
@@ -154,12 +154,12 @@ async def comprehensive_health_check():
     """
     Comprehensive system health check returning individual status for Ollama, Supabase, Redis, Kokoro TTS, and FFmpeg.
     """
-    # 1. Ollama health
-    ollama_status = "offline"
+    # 1. Gemini health
+    gemini_status = "offline"
     try:
-        o_health = await ollama_service.check_health()
-        if isinstance(o_health, dict) and o_health.get("status") in ["healthy", "online"]:
-            ollama_status = "online"
+        g_health = await gemini_service.check_health()
+        if isinstance(g_health, dict) and g_health.get("status") in ["healthy", "online"]:
+            gemini_status = "online"
     except Exception:
         pass
 
@@ -198,14 +198,14 @@ async def comprehensive_health_check():
     else:
         ffmpeg_status = "online" # Fallback online state if mock installed
 
-    all_online = all(s == "online" for s in [ollama_status, supabase_status, redis_status, kokoro_status, ffmpeg_status])
+    all_online = all(s == "online" for s in [gemini_status, supabase_status, redis_status, kokoro_status, ffmpeg_status])
 
     return {
         "status": "ok" if all_online else "degraded",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "environment": settings.ENVIRONMENT,
         "services": {
-            "ollama": ollama_status,
+            "gemini": gemini_status,
             "supabase": supabase_status,
             "redis": redis_status,
             "kokoro": kokoro_status,
@@ -213,10 +213,10 @@ async def comprehensive_health_check():
         }
     }
 
-@app.get("/api/health/ollama")
-async def ollama_health_check():
-    """Health check endpoint for local Ollama LLM server status."""
-    return await ollama_service.check_health()
+@app.get("/api/health/gemini")
+async def gemini_health_check():
+    """Health check endpoint for Google Gemini API status."""
+    return await gemini_service.check_health()
 
 @app.get("/api/health/tts")
 async def tts_health_check():
@@ -225,15 +225,13 @@ async def tts_health_check():
 
 @app.get("/api/health/vision")
 async def vision_health_check():
-    """Health check endpoint for local Ollama llama3.2-vision LLM status."""
-    health = await ollama_service.check_health()
-    models = health.get("models", []) if isinstance(health, dict) else []
-    vision_available = any("vision" in str(m).lower() or "llama3.2" in str(m).lower() for m in models)
+    """Health check endpoint for Gemini Vision multimodal status."""
+    health = await gemini_service.check_health()
     return {
-        "status": "healthy" if health.get("status") == "healthy" else "degraded",
-        "vision_model": "llama3.2-vision:11b",
-        "vision_available": vision_available,
-        "fallback_ocr": ["EasyOCR", "Tesseract --psm 6"]
+        "status": "healthy" if health.get("status") in ["online", "healthy"] else "degraded",
+        "vision_model": settings.GEMINI_VISION_MODEL,
+        "vision_available": health.get("status") in ["online", "healthy"],
+        "fallback_ocr": ["TrOCR", "EasyOCR", "Tesseract --psm 6"]
     }
 
 # --- Celery Task Status Endpoint ---
@@ -444,6 +442,23 @@ async def complete_study_task_endpoint(
 ):
     """Marks a specific study task as complete."""
     return await study_service.complete_study_task(user["user_id"], task_id)
+
+# --- Ask Focusly Endpoint ---
+
+@app.post("/api/study/ask")
+async def ask_focusly_endpoint(
+    payload: Dict[str, Any],
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Ask Focusly AI Q&A chatbot grounded in student study documents and learning history.
+    """
+    question = payload.get("question")
+    if not question:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing question parameter")
+
+    document_id = payload.get("document_id")
+    return await study_service.ask_focusly_question(user["user_id"], question, document_id=document_id)
 
 # --- Public Exam Profile Endpoints ---
 

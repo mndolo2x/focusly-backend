@@ -651,7 +651,7 @@
           "admin"
         ],
         "summary": "Research Exam Profile",
-        "description": "Uses Ollama to research and generate structured exam profile:\nexam_name, sections, question_types, time_limit, total_questions, scoring_rules, disclaimer_text.\nRequires user.is_admin metadata flag.",
+        "description": "Uses Gemini AI to research and generate structured exam profile:\nexam_name, sections, question_types, time_limit, total_questions, scoring_rules, disclaimer_text.\nRequires user.is_admin metadata flag.",
         "operationId": "research_exam_profile_api_admin_exams_research_post",
         "requestBody": {
           "content": {
@@ -946,11 +946,11 @@
         }
       }
     },
-    "/api/health/ollama": {
+    "/api/health/gemini": {
       "get": {
-        "summary": "Ollama Health Check",
-        "description": "Health check endpoint for local Ollama LLM server status.",
-        "operationId": "ollama_health_check_api_health_ollama_get",
+        "summary": "Gemini Health Check",
+        "description": "Health check endpoint for Google Gemini API status.",
+        "operationId": "gemini_health_check_api_health_gemini_get",
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -983,7 +983,7 @@
     "/api/health/vision": {
       "get": {
         "summary": "Vision Health Check",
-        "description": "Health check endpoint for local Ollama llama3.2-vision LLM status.",
+        "description": "Health check endpoint for Gemini Vision multimodal status.",
         "operationId": "vision_health_check_api_health_vision_get",
         "responses": {
           "200": {
@@ -1485,6 +1485,50 @@
             }
           }
         }
+      }
+    },
+    "/api/study/ask": {
+      "post": {
+        "summary": "Ask Focusly Endpoint",
+        "description": "Ask Focusly AI Q&A chatbot grounded in student study documents and learning history.",
+        "operationId": "ask_focusly_endpoint_api_study_ask_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
       }
     },
     "/exams": {

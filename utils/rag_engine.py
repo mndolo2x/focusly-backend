@@ -2,10 +2,10 @@ import re
 from typing import List, Dict, Any, Optional
 import numpy as np
 import faiss
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 
 class RAGEngine:
-    """FAISS vector database RAG engine with Ollama embeddings for chunking and semantic search."""
+    """FAISS vector database RAG engine with Gemini embeddings for chunking and semantic search."""
 
     def __init__(self, dimension: int = 768):
         self.dimension = dimension
@@ -13,7 +13,7 @@ class RAGEngine:
         self.chunks: List[Dict[str, Any]] = []
 
     def _pseudo_embedding(self, text: str) -> np.ndarray:
-        """Fallback deterministic pseudo-embedding vector if Ollama embedding service is offline."""
+        """Fallback deterministic pseudo-embedding vector if Gemini embedding service is offline."""
         vec = np.zeros(self.dimension, dtype=np.float32)
         for i, char in enumerate(text.encode("utf-8")):
             vec[i % self.dimension] += ord(chr(char))
@@ -23,13 +23,12 @@ class RAGEngine:
         return vec
 
     async def generate_embedding(self, text: str) -> np.ndarray:
-        """Generates vector embedding using Ollama nomic-embed-text model with fallback."""
+        """Generates vector embedding using Gemini embedding model with fallback."""
         try:
-            vector = await ollama_service.embed(text, model="nomic-embed-text")
+            vector = await gemini_service.embed_text(text)
             if vector:
                 arr = np.array(vector, dtype=np.float32)
                 if len(arr) != self.dimension:
-                    # Adjust dimension dynamically if nomic-embed-text uses 768 or 384 dims
                     if self.index.ntotal == 0:
                         self.dimension = len(arr)
                         self.index = faiss.IndexFlatL2(self.dimension)

@@ -14,7 +14,7 @@ from models import (
     AdminUsageAdjustRequest,
     AdminUserStatusUpdate,
 )
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -30,7 +30,7 @@ async def get_system_status(admin_user: Dict[str, Any] = Depends(get_admin_user)
         "version": "1.0.0",
         "services": {
             "database": "connected",
-            "ollama": "ready",
+            "gemini": "ready",
             "tts": "ready"
         }
     }
@@ -223,7 +223,7 @@ async def get_system_logs_admin(
     """
     now_iso = datetime.utcnow().isoformat()
     mock_logs = [
-        {"timestamp": now_iso, "level": "INFO", "component": "ollama_service", "message": "Ollama health check online"},
+        {"timestamp": now_iso, "level": "INFO", "component": "gemini_service", "message": "Gemini AI health check online"},
         {"timestamp": now_iso, "level": "INFO", "component": "celery_worker", "message": "Celery Beat cron schedule active"},
         {"timestamp": now_iso, "level": "INFO", "component": "tts_engine", "message": "Kokoro TTS engine initialized"}
     ]
@@ -309,7 +309,7 @@ async def research_exam_profile(
     admin_user: Dict[str, Any] = Depends(get_admin_user)
 ):
     """
-    Uses Ollama to research and generate structured exam profile:
+    Uses Gemini AI to research and generate structured exam profile:
     exam_name, sections, question_types, time_limit, total_questions, scoring_rules, disclaimer_text.
     Requires user.is_admin metadata flag.
     """
@@ -339,7 +339,7 @@ async def research_exam_profile(
     system = "You are an expert academic curriculum researcher. Always return valid structured JSON for exam specifications."
 
     try:
-        data = await ollama_service.generate_json(prompt, system_prompt=system)
+            data = await gemini_service.generate_json(prompt, system_prompt=system)
     except Exception:
         data = {}
 

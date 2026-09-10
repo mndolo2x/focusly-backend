@@ -5,7 +5,7 @@ import pytest
 from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 from main import app
-from services.ollama_service import ollama_service
+from services.gemini_service import gemini_service
 
 client = TestClient(app)
 
@@ -88,13 +88,13 @@ def test_timed_exam_mode_flow(monkeypatch):
 def test_monitoring_and_health_endpoints(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    async def mock_health():
-        return {"status": "online", "models": ["llama3.1:8b"]}
+    async def mock_gemini_health():
+        return {"status": "online", "provider": "google_gemini"}
 
     async def mock_tts_health():
         return {"status": "online", "engine": "Kokoro TTS"}
 
-    monkeypatch.setattr("services.ollama_service.ollama_service.check_health", mock_health)
+    monkeypatch.setattr("services.gemini_service.gemini_service.check_health", mock_gemini_health)
     monkeypatch.setattr("services.tts_service.tts_service.check_health", mock_tts_health)
 
     # 1. Comprehensive Health Check
@@ -103,7 +103,7 @@ def test_monitoring_and_health_endpoints(monkeypatch):
     h_data = health_res.json()
     assert h_data["status"] == "ok"
     assert "services" in h_data
-    assert h_data["services"]["ollama"] == "online"
+    assert h_data["services"]["gemini"] == "online"
     assert h_data["services"]["supabase"] == "online"
     assert h_data["services"]["redis"] == "online"
     assert h_data["services"]["kokoro"] == "online"
@@ -307,17 +307,40 @@ def test_public_share_links_flow(monkeypatch):
 def test_vision_health_check(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    async def mock_ollama_health():
-        return {"status": "healthy", "models": ["llama3.2-vision:11b", "nomic-embed-text"]}
+    async def mock_gemini_health():
+        return {"status": "online", "provider": "google_gemini"}
 
-    monkeypatch.setattr("services.ollama_service.ollama_service.check_health", mock_ollama_health)
+    monkeypatch.setattr("services.gemini_service.gemini_service.check_health", mock_gemini_health)
 
     res = client.get("/api/health/vision")
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "healthy"
     assert data["vision_available"] is True
-    assert "llama3.2-vision" in data["vision_model"]
+    assert "gemini" in data["vision_model"]
+
+def test_ask_focusly_endpoint_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    async def mock_ask(question, context_text=None, student_history=None):
+        return {
+            "question": question,
+            "answer": "Mitosis is the process of cell division.",
+            "grounded_in_context": True,
+            "timestamp": 1234567890
+        }
+
+    monkeypatch.setattr("services.gemini_service.gemini_service.ask_focusly", mock_ask)
+
+    res = client.post(
+        "/api/study/ask",
+        json={"question": "Explain mitosis simply", "document_id": "doc_123"},
+        headers=get_auth_headers()
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["question"] == "Explain mitosis simply"
+    assert "Mitosis" in data["answer"]
 
 def test_image_notes_upload_and_status_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
@@ -414,7 +437,8 @@ def test_image_notes_low_confidence_flagging(monkeypatch):
     assert "low OCR confidence" in res_data["message"]
 
 @pytest.mark.anyio
-async def test_ollama_service_generate_retry_error_handling(monkeypatch):
+async def test_gemini_service_generate_retry_error_handling(monkeypatch):
+    monkeypatch.setattr("services.gemini_service.gemini_service.api_key", "invalid_key")
     with pytest.raises(RuntimeError) as exc_info:
-        await ollama_service.generate("Test prompt", max_retries=2, retry_delay=0.01)
-    assert "Ollama connection error" in str(exc_info.value) or "Ollama" in str(exc_info.value)
+        await gemini_service.generate_text("Test prompt", max_retries=2, retry_delay=0.01)
+    assert "Focusly couldn't process" in str(exc_info.value) or "Gemini" in str(exc_info.value)
