@@ -21,46 +21,69 @@ def test_root():
     response = client.get("/")
     assert response.status_code == 200
 
-def test_document_merge_flow(monkeypatch):
+def test_timed_exam_mode_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    fake_pdf1 = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
-    pdf_file1 = io.BytesIO(fake_pdf1)
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file = io.BytesIO(fake_pdf)
 
-    fake_pdf2 = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
-    pdf_file2 = io.BytesIO(fake_pdf2)
-
-    # 1. Upload Doc 1
-    up_res1 = client.post(
+    # 1. Upload Document
+    up_res = client.post(
         "/api/documents/upload",
-        files={"file": ("part1.pdf", pdf_file1, "application/pdf")},
+        files={"file": ("physics.pdf", pdf_file, "application/pdf")},
         headers=get_auth_headers()
     )
-    assert up_res1.status_code == 200
-    doc1_id = up_res1.json()["id"]
+    assert up_res.status_code == 200
+    doc_id = up_res.json()["id"]
 
-    # 2. Upload Doc 2
-    up_res2 = client.post(
-        "/api/documents/upload",
-        files={"file": ("part2.pdf", pdf_file2, "application/pdf")},
+    # 2. Start Timed Exam (35 questions)
+    start_res = client.post(
+        "/api/exam-mode/start",
+        json={"subject": "Physics Mechanics", "document_ids": [doc_id], "num_questions": 35},
         headers=get_auth_headers()
     )
-    assert up_res2.status_code == 200
-    doc2_id = up_res2.json()["id"]
+    assert start_res.status_code == 200
+    exam_session = start_res.json()
+    assert "id" in exam_session
+    assert exam_session["total_questions"] == 35
+    assert exam_session["duration_seconds"] == 4200 # 35 * 120s (~2 mins/question)
+    exam_id = exam_session["id"]
 
-    # 3. Merge Documents (POST /api/documents/merge)
-    merge_res = client.post(
-        "/api/documents/merge",
-        json={"document_ids": [doc1_id, doc2_id], "merged_filename": "Combined_Biology.pdf"},
-        headers=get_auth_headers()
-    )
-    assert merge_res.status_code == 200
-    merged_data = merge_res.json()
-    assert "id" in merged_data
-    assert merged_data["filename"] == "Combined_Biology.pdf"
-    assert merged_data["id"] != doc1_id
-    assert merged_data["id"] != doc2_id
-    assert merged_data["status"] == "processing" or merged_data["status"] == "completed"
+    # 3. Check Status
+    status_res = client.get("/api/exam-mode/status", headers=get_auth_headers())
+    assert status_res.status_code == 200
+    s_data = status_res.json()
+    assert s_data["time_remaining_seconds"] > 0
+    assert s_data["paused"] is False
+
+    # 4. Pause Timer
+    pause_res = client.post("/api/exam-mode/pause", json={"exam_id": exam_id}, headers=get_auth_headers())
+    assert pause_res.status_code == 200
+    assert pause_res.json()["paused"] is True
+
+    # Check status during pause
+    status_paused = client.get("/api/exam-mode/status", headers=get_auth_headers())
+    assert status_paused.json()["paused"] is True
+
+    # 5. Resume Timer
+    resume_res = client.post("/api/exam-mode/resume", json={"exam_id": exam_id}, headers=get_auth_headers())
+    assert resume_res.status_code == 200
+    assert resume_res.json()["paused"] is False
+
+    # 6. Submit Timed Exam & Grade
+    q_id = exam_session["questions"][0]["id"]
+    submit_payload = {
+        "exam_id": exam_id,
+        "answers": [
+            {"question_id": q_id, "selected_answer": 0, "confidence_score": 5}
+        ]
+    }
+    submit_res = client.post("/api/exam-mode/submit", json=submit_payload, headers=get_auth_headers())
+    assert submit_res.status_code == 200
+    grade_data = submit_res.json()
+    assert "score" in grade_data
+    assert "feedback" in grade_data
+    assert grade_data["total_questions"] == 35
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

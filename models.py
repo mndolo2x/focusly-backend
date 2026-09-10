@@ -43,6 +43,31 @@ class DocumentMergeRequest(BaseModel):
     document_ids: List[str]
     merged_filename: Optional[str] = "Merged_Document.pdf"
 
+# --- TIMED EXAM MODE MODELS ---
+
+class TimedExamStartRequest(BaseModel):
+    subject: str
+    document_ids: List[str] = []
+    num_questions: Optional[int] = Field(35, ge=30, le=50)
+
+class TimedExamAnswerItem(BaseModel):
+    question_id: str
+    selected_answer: int
+    confidence_score: Optional[int] = 3
+
+class TimedExamSubmissionRequest(BaseModel):
+    exam_id: Optional[str] = None
+    answers: List[TimedExamAnswerItem] = []
+
+class TimedExamStatusResponse(BaseModel):
+    exam_id: str
+    subject: str
+    time_remaining_seconds: int
+    current_question: int
+    total_questions: int
+    progress_percent: float
+    paused: bool
+
 # --- ADMIN EXAM MODELS ---
 
 class ExamResearchRequest(BaseModel):

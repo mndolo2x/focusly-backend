@@ -26,6 +26,9 @@ from models import (
     StudyPlanCreateAI,
     StudyPlanUpdateAI,
     DocumentMergeRequest,
+    TimedExamStartRequest,
+    TimedExamSubmissionRequest,
+    TimedExamStatusResponse,
 )
 from services.document_service import document_service
 from services.summary_service import summary_service
@@ -91,6 +94,57 @@ async def get_dashboard_progress(
     weak_areas, reviews_due_today, upcoming_reviews, study_plan, exam_countdown.
     """
     return await study_service.get_dashboard_progress(user["user_id"])
+
+# --- Timed Exam Mode Endpoints ---
+
+@app.post("/api/exam-mode/start")
+async def start_timed_exam_endpoint(
+    payload: TimedExamStartRequest,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Combines documents and generates a long-form timed test (30-50 questions, ~2 min/question time limit).
+    """
+    session = await study_service.start_timed_exam(
+        user["user_id"], payload.subject, payload.document_ids, num_questions=payload.num_questions or 35
+    )
+    return session
+
+@app.get("/api/exam-mode/status")
+async def get_timed_exam_status_endpoint(
+    exam_id: Optional[str] = None,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns time_remaining, current_question, total_questions, and progress."""
+    status_data = await study_service.get_timed_exam_status(user["user_id"], exam_id)
+    return status_data
+
+@app.post("/api/exam-mode/pause")
+async def pause_timed_exam_endpoint(
+    payload: Optional[Dict[str, Any]] = None,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Pauses active exam timer (resumable within 24 hours)."""
+    exam_id = payload.get("exam_id") if payload else None
+    return await study_service.pause_timed_exam(user["user_id"], exam_id)
+
+@app.post("/api/exam-mode/resume")
+async def resume_timed_exam_endpoint(
+    payload: Optional[Dict[str, Any]] = None,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Resumes paused exam timer."""
+    exam_id = payload.get("exam_id") if payload else None
+    return await study_service.resume_timed_exam(user["user_id"], exam_id)
+
+@app.post("/api/exam-mode/submit")
+async def submit_timed_exam_endpoint(
+    payload: TimedExamSubmissionRequest,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Grades timed exam test, updates weak areas, and returns score and feedback."""
+    answers = [a.model_dump() for a in payload.answers] if payload.answers else []
+    return await study_service.submit_timed_exam(user["user_id"], payload.exam_id, answers)
 
 # --- AI Study Plan Builder Endpoints ---
 

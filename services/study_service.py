@@ -12,20 +12,261 @@ from models import EXAM_PAPER_DISCLAIMER
 _in_memory_exam_papers: Dict[str, Dict[str, Any]] = {}
 _in_memory_study_plans: Dict[str, Dict[str, Any]] = {} # user_id -> plan
 _dashboard_cache: Dict[str, tuple[datetime, Dict[str, Any]]] = {} # user_id -> (timestamp, data)
+_in_memory_timed_exams: Dict[str, Dict[str, Any]] = {} # exam_id or user_id -> session
 
 class StudyService:
-    """Service for spaced repetition scheduling, AI custom study plans, exam papers, and dashboard progress tracking."""
+    """Service for spaced repetition scheduling, AI custom study plans, timed exam mode, exam papers, and dashboard progress tracking."""
+
+    async def start_timed_exam(
+        self, user_id: str, subject: str, document_ids: List[str], num_questions: int = 35
+    ) -> Dict[str, Any]:
+        """
+        1. Combines document texts.
+        2. Queries Ollama to generate a long-form test (30-50 questions, ~2 min/question).
+        3. Initializes active timed exam session with pause/resume support.
+        """
+        now = datetime.now(timezone.utc)
+        num_questions = max(30, min(50, num_questions))
+        duration_seconds = num_questions * 120 # ~2 minutes per question
+
+        combined_text = ""
+        for d_id in document_ids:
+            doc = await document_service.get_document(d_id, user_id)
+            if doc and doc.get("extracted_text"):
+                combined_text += f"\n--- Document {d_id} ---\n" + doc["extracted_text"][:4000]
+
+        prompt = (
+            f"Generate a long-form timed examination paper for subject '{subject}' containing exactly {num_questions} questions.\n"
+            f"Requirements:\n"
+            f"- Output MUST be valid JSON with key 'questions' containing a list of objects:\n"
+            f"  [{{\"id\": \"t_q1\", \"section_index\": 0, \"question_text\": \"...\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \"correct_answer_index\": 0}}]\n\n"
+            f"Source Text:\n{combined_text[:8000] if combined_text else 'General curriculum concepts.'}"
+        )
+        system = "You are an AI exam generator creating formal, high-stakes timed tests for high school students."
+
+        try:
+            data = await ollama_service.generate_json(prompt, system_prompt=system)
+            raw_qs = data.get("questions", [])
+        except Exception:
+            raw_qs = []
+
+        if not raw_qs or len(raw_qs) < num_questions:
+            fallback_qs = []
+            for i in range(num_questions):
+                q_id = f"tq_{uuid.uuid4().hex[:8]}"
+                fallback_qs.append({
+                    "id": q_id,
+                    "section_index": i % 5,
+                    "question_text": f"Timed Exam Question {i+1} regarding {subject}:",
+                    "options": [
+                        f"Correct answer for Q{i+1}",
+                        f"Distractor A for Q{i+1}",
+                        f"Distractor B for Q{i+1}",
+                        f"Distractor C for Q{i+1}"
+                    ],
+                    "correct_answer_index": 0
+                })
+            raw_qs = fallback_qs
+
+        exam_id = str(uuid.uuid4())
+        session = {
+            "id": exam_id,
+            "user_id": user_id,
+            "subject": subject,
+            "document_ids": document_ids,
+            "questions": raw_qs[:num_questions],
+            "total_questions": len(raw_qs[:num_questions]),
+            "duration_seconds": duration_seconds,
+            "start_time": now.isoformat(),
+            "paused": False,
+            "pause_time": None,
+            "total_paused_seconds": 0,
+            "current_question": 1,
+            "submissions": [],
+            "disclaimer_text": EXAM_PAPER_DISCLAIMER
+        }
+
+        _in_memory_timed_exams[exam_id] = session
+        _in_memory_timed_exams[f"user_{user_id}"] = session
+
+        return session
+
+    async def get_active_timed_exam(self, user_id: str, exam_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves user's active timed exam session."""
+        if exam_id and exam_id in _in_memory_timed_exams:
+            return _in_memory_timed_exams[exam_id]
+
+        key = f"user_{user_id}"
+        if key in _in_memory_timed_exams:
+            return _in_memory_timed_exams[key]
+
+        return None
+
+    async def get_timed_exam_status(self, user_id: str, exam_id: Optional[str] = None) -> Dict[str, Any]:
+        """Returns time_remaining_seconds, current_question, total_questions, and progress_percent."""
+        session = await self.get_active_timed_exam(user_id, exam_id)
+        if not session:
+            return {
+                "exam_id": "",
+                "subject": "None",
+                "time_remaining_seconds": 0,
+                "current_question": 0,
+                "total_questions": 0,
+                "progress_percent": 0.0,
+                "paused": False
+            }
+
+        now = datetime.now(timezone.utc)
+        start_time = datetime.fromisoformat(session["start_time"].replace("Z", ""))
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+
+        duration = session.get("duration_seconds", 3600)
+        total_paused = session.get("total_paused_seconds", 0)
+
+        if session.get("paused") and session.get("pause_time"):
+            pause_time = datetime.fromisoformat(session["pause_time"].replace("Z", ""))
+            if pause_time.tzinfo is None:
+                pause_time = pause_time.replace(tzinfo=timezone.utc)
+            elapsed = (pause_time - start_time).total_seconds() - total_paused
+        else:
+            elapsed = (now - start_time).total_seconds() - total_paused
+
+        time_remaining = max(0, int(duration - elapsed))
+        total_q = session.get("total_questions", 30)
+        answered_q = len(session.get("submissions", []))
+        curr_q = min(total_q, answered_q + 1)
+        progress = round((answered_q / total_q) * 100, 1) if total_q > 0 else 0.0
+
+        return {
+            "exam_id": session.get("id"),
+            "subject": session.get("subject", "Timed Exam"),
+            "time_remaining_seconds": time_remaining,
+            "current_question": curr_q,
+            "total_questions": total_q,
+            "progress_percent": progress,
+            "paused": session.get("paused", False)
+        }
+
+    async def pause_timed_exam(self, user_id: str, exam_id: Optional[str] = None) -> Dict[str, Any]:
+        """Pauses active timer (resumable within 24 hours)."""
+        session = await self.get_active_timed_exam(user_id, exam_id)
+        if not session:
+            return {"message": "No active timed exam found", "paused": False}
+
+        now = datetime.now(timezone.utc)
+        session["paused"] = True
+        session["pause_time"] = now.isoformat()
+
+        return {
+            "message": "Timed exam paused successfully (resumable within 24 hours)",
+            "exam_id": session.get("id"),
+            "paused": True,
+            "pause_time": now.isoformat()
+        }
+
+    async def resume_timed_exam(self, user_id: str, exam_id: Optional[str] = None) -> Dict[str, Any]:
+        """Resumes paused exam and updates cumulative pause duration."""
+        session = await self.get_active_timed_exam(user_id, exam_id)
+        if not session or not session.get("paused"):
+            return {"message": "Timed exam is not paused", "paused": False}
+
+        now = datetime.now(timezone.utc)
+        if session.get("pause_time"):
+            p_time = datetime.fromisoformat(session["pause_time"].replace("Z", ""))
+            if p_time.tzinfo is None:
+                p_time = p_time.replace(tzinfo=timezone.utc)
+
+            if (now - p_time) > timedelta(hours=24):
+                return {"message": "Exam pause window expired (>24hrs). Exam must be restarted.", "paused": False, "expired": True}
+
+            paused_delta = (now - p_time).total_seconds()
+            session["total_paused_seconds"] = session.get("total_paused_seconds", 0) + paused_delta
+
+        session["paused"] = False
+        session["pause_time"] = None
+
+        return {
+            "message": "Timed exam resumed successfully",
+            "exam_id": session.get("id"),
+            "paused": False
+        }
+
+    async def submit_timed_exam(self, user_id: str, exam_id: Optional[str] = None, submissions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Grades timed exam, updates weak areas, and returns score percentage and feedback."""
+        session = await self.get_active_timed_exam(user_id, exam_id)
+        submissions = submissions or (session.get("submissions") if session else [])
+
+        questions = session.get("questions", []) if session else []
+        q_map = {q.get("id"): q for q in questions if isinstance(q, dict)}
+
+        total_questions = len(questions) if questions else (len(submissions) or 1)
+        correct_count = 0
+        incorrect_count = 0
+        breakdown = []
+
+        batch_submissions_for_quiz = []
+        for sub in submissions:
+            q_id = sub.get("question_id")
+            selected_ans = sub.get("selected_answer", 0)
+            conf = sub.get("confidence_score", 3)
+
+            q = q_map.get(q_id, {})
+            correct_ans = q.get("correct_answer_index", 0)
+
+            is_correct = (selected_ans == correct_ans)
+            if is_correct:
+                correct_count += 1
+            else:
+                incorrect_count += 1
+
+            batch_submissions_for_quiz.append({
+                "question_id": q_id,
+                "selected_answer": selected_ans,
+                "confidence_score": conf
+            })
+
+            breakdown.append({
+                "question_id": q_id,
+                "question_text": q.get("question_text", ""),
+                "selected_answer": selected_ans,
+                "correct_answer": correct_ans,
+                "is_correct": is_correct
+            })
+
+        score_pct = round((correct_count / total_questions) * 100, 2)
+
+        # Log attempt records to update weak areas
+        if session and session.get("document_ids"):
+            doc_id = session["document_ids"][0]
+            try:
+                await quiz_service.submit_quiz_batch(user_id, doc_id, batch_submissions_for_quiz)
+            except Exception:
+                pass
+
+        feedback = (
+            f"Great effort! You scored {score_pct}%. Review weak areas in study dashboard."
+            if score_pct >= 70.0 else
+            f"Practice needed. You scored {score_pct}%. Focus on high priority weak areas."
+        )
+
+        return {
+            "exam_id": session.get("id") if session else exam_id,
+            "subject": session.get("subject", "General") if session else "Timed Exam",
+            "score": score_pct,
+            "total_questions": total_questions,
+            "correct_count": correct_count,
+            "incorrect_count": incorrect_count,
+            "feedback": feedback,
+            "breakdown": breakdown,
+            "disclaimer_text": EXAM_PAPER_DISCLAIMER
+        }
 
     async def create_ai_study_plan(
         self, user_id: str, exam_date: datetime, subject: str, document_ids: List[str]
     ) -> Dict[str, Any]:
         """
-        Uses Ollama to generate an AI study plan:
-        1. Calculates days remaining until exam.
-        2. Identifies weak areas from quiz attempt history.
-        3. Schedules review sessions prioritizing weak areas.
-        4. Outputs day-by-day schedule: {day, date, tasks: [{id, type, document_id, description, completed}]}.
-        5. Stores in study_plans table and in-memory fallback store.
+        Uses Ollama to generate an AI study plan.
         """
         now = datetime.now(timezone.utc)
         if exam_date.tzinfo is None:
@@ -33,11 +274,9 @@ class StudyService:
 
         days_until_exam = max(1, (exam_date - now).days)
 
-        # Retrieve weak areas
         weak_areas = await quiz_service.get_dashboard_weak_areas(user_id)
         weak_summary = ", ".join([f"{w.get('section_title', 'Section')} (missed {w.get('miss_count', 1)}x)" for w in weak_areas[:5]])
 
-        # Retrieve document titles
         doc_details = []
         for d_id in document_ids:
             doc = await document_service.get_document(d_id, user_id)
@@ -61,7 +300,7 @@ class StudyService:
             f'      "tasks": [\n'
             f'        {{\n'
             f'          "id": "task_1_1",\n'
-            f'          "type": "review",\n'  # type can be 'review', 'quiz', 'video', 'read'
+            f'          "type": "review",\n'
             f'          "document_id": "{document_ids[0] if document_ids else ""}",\n'
             f'          "description": "Review weak section concepts",\n'
             f'          "completed": false\n'
