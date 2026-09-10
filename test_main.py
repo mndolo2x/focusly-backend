@@ -85,6 +85,115 @@ def test_timed_exam_mode_flow(monkeypatch):
     assert "feedback" in grade_data
     assert grade_data["total_questions"] == 35
 
+def test_vision_health_check(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    async def mock_ollama_health():
+        return {"status": "healthy", "models": ["llama3.2-vision:11b", "nomic-embed-text"]}
+
+    monkeypatch.setattr("services.ollama_service.ollama_service.check_health", mock_ollama_health)
+
+    res = client.get("/api/health/vision")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "healthy"
+    assert data["vision_available"] is True
+    assert "llama3.2-vision" in data["vision_model"]
+
+def test_image_notes_upload_and_status_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (200, 200), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((10, 10), "Handwritten note content", fill=(0, 0, 0))
+
+    img_bytes_io = io.BytesIO()
+    img.save(img_bytes_io, format="JPEG")
+    img_bytes = img_bytes_io.getvalue()
+
+    # Mock OCR response
+    async def mock_transcribe(image_input, page_num=1):
+        return {
+            "virtual_page": page_num,
+            "text": f"--- Virtual Page {page_num} ---\nPhysics formulas\n[DIAGRAM: Circuit diagram with resistor and battery]",
+            "raw_text": "Physics formulas\n[DIAGRAM: Circuit diagram with resistor and battery]",
+            "confidence": 0.88,
+            "ocr_tier": "llama3.2-vision",
+            "diagrams": ["Circuit diagram with resistor and battery"],
+            "is_blurry": False,
+            "is_low_confidence": False,
+            "blur_score": 150.0
+        }
+
+    monkeypatch.setattr("utils.handwriting_ocr.handwriting_ocr.transcribe_handwritten_image", mock_transcribe)
+
+    upload_res = client.post(
+        "/api/documents/upload-image",
+        files=[
+            ("files", ("page1.jpg", io.BytesIO(img_bytes), "image/jpeg")),
+            ("files", ("page2.jpg", io.BytesIO(img_bytes), "image/jpeg"))
+        ],
+        headers=get_auth_headers()
+    )
+
+    assert upload_res.status_code == 200
+    res_data = upload_res.json()
+    assert "id" in res_data
+    doc_id = res_data["id"]
+    assert res_data["source_type"] == "image_notes"
+    assert res_data["page_count"] == 2
+    assert res_data["ocr_confidence"] == 0.88
+    assert len(res_data["virtual_page_map"]) == 2
+    assert res_data["virtual_page_map"][0]["virtual_page"] == 1
+    assert "Circuit diagram" in res_data["virtual_page_map"][0]["diagrams_extracted"][0]
+
+    # Check status endpoint
+    status_res = client.get(f"/api/documents/{doc_id}/status", headers=get_auth_headers())
+    assert status_res.status_code == 200
+    st_data = status_res.json()
+    assert st_data["id"] == doc_id
+    assert st_data["source_type"] == "image_notes"
+    assert st_data["page_count"] == 2
+    assert len(st_data["virtual_page_map"]) == 2
+
+def test_image_notes_low_confidence_flagging(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), color=(100, 100, 100))
+    img_bytes_io = io.BytesIO()
+    img.save(img_bytes_io, format="JPEG")
+    img_bytes = img_bytes_io.getvalue()
+
+    # Mock low confidence OCR result
+    async def mock_low_conf_transcribe(image_input, page_num=1):
+        return {
+            "virtual_page": page_num,
+            "text": f"--- Virtual Page {page_num} ---\nunreadable scribble",
+            "raw_text": "unreadable scribble",
+            "confidence": 0.35,
+            "ocr_tier": "tesseract",
+            "diagrams": [],
+            "is_blurry": True,
+            "is_low_confidence": True,
+            "blur_score": 40.0
+        }
+
+    monkeypatch.setattr("utils.handwriting_ocr.handwriting_ocr.transcribe_handwritten_image", mock_low_conf_transcribe)
+
+    upload_res = client.post(
+        "/api/documents/upload-image",
+        files=[("files", ("blurry.jpg", io.BytesIO(img_bytes), "image/jpeg"))],
+        headers=get_auth_headers()
+    )
+
+    assert upload_res.status_code == 200
+    res_data = upload_res.json()
+    assert res_data["status"] == "low_confidence"
+    assert res_data["ocr_confidence"] == 0.35
+    assert "low OCR confidence" in res_data["message"]
+
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):
     with pytest.raises(RuntimeError) as exc_info:

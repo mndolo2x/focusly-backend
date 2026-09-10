@@ -8,6 +8,11 @@ class DocumentStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     VIDEO_READY = "video_ready"
+    LOW_CONFIDENCE = "low_confidence"
+
+class SourceType(str, Enum):
+    PDF = "pdf"
+    IMAGE_NOTES = "image_notes"
 
 # --- AUTH MODELS ---
 
@@ -173,6 +178,9 @@ class DocumentBase(BaseModel):
     extracted_text: Optional[str] = None
     status: DocumentStatus = DocumentStatus.PROCESSING
     page_count: Optional[int] = 0
+    source_type: Optional[SourceType] = SourceType.PDF
+    original_images: Optional[List[str]] = []
+    virtual_page_map: Optional[List[Dict[str, Any]]] = []
 
 class DocumentCreate(DocumentBase):
     pass
@@ -183,6 +191,16 @@ class DocumentResponse(DocumentBase):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+class ImageNotesUploadResponse(BaseModel):
+    id: str
+    filename: str
+    status: DocumentStatus
+    source_type: SourceType = SourceType.IMAGE_NOTES
+    page_count: int
+    virtual_page_map: List[Dict[str, Any]]
+    ocr_confidence: float
+    message: Optional[str] = None
 
 class SummaryDepth(str, Enum):
     QUICK = "quick"

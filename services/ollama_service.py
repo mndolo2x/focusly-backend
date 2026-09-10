@@ -135,6 +135,50 @@ class OllamaService:
             "error": "Ollama service unavailable",
         }
 
+    async def generate_with_image(
+        self,
+        prompt: str,
+        image_base64: str,
+        model: str = "llama3.2-vision:11b",
+        system_prompt: Optional[str] = None,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Generates text or multimodal analysis from local Ollama model accepting base64 encoded image(s).
+        """
+        url = f"{self.base_url}/api/generate"
+        payload: Dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "images": [image_base64],
+            "stream": False,
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        logger.info(f"Ollama Generate Vision Request -> Model: {model}, URL: {url}, Image len: {len(image_base64)}")
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(url, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    res_text = data.get("response", "")
+                    logger.info(f"Ollama Generate Vision Success -> Model: {model}, Response len: {len(res_text)}")
+                    return {"response": res_text, "data": data}
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                logger.warning(
+                    f"Ollama Vision Attempt {attempt}/{max_retries} failed for model {model}: {str(e)}"
+                )
+                if attempt == max_retries:
+                    logger.error(f"Ollama Vision max retries reached ({max_retries}). Request failed: {str(e)}")
+                    raise RuntimeError(f"Ollama vision connection error: {str(e)}")
+                await asyncio.sleep(retry_delay * attempt)
+
+        raise RuntimeError("Ollama generate_with_image failed unexpectedly")
+
     # Backwards compatibility methods
     async def generate_completion(self, prompt: str, system_prompt: Optional[str] = None, json_mode: bool = False) -> str:
         return await self.generate(prompt, model=self.default_model, system_prompt=system_prompt, json_mode=json_mode)

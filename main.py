@@ -9,6 +9,9 @@ from auth import get_current_user, router as auth_router
 from config import settings
 from models import (
     DocumentResponse,
+    ImageNotesUploadResponse,
+    SourceType,
+    DocumentStatus,
     SummaryCreate,
     SummaryResponse,
     QuizAttemptCreate,
@@ -81,6 +84,19 @@ async def ollama_health_check():
 async def tts_health_check():
     """Health check endpoint for local Kokoro TTS engine status."""
     return await tts_service.check_health()
+
+@app.get("/api/health/vision")
+async def vision_health_check():
+    """Health check endpoint for local Ollama llama3.2-vision LLM status."""
+    health = await ollama_service.check_health()
+    models = health.get("models", []) if isinstance(health, dict) else []
+    vision_available = any("vision" in str(m).lower() or "llama3.2" in str(m).lower() for m in models)
+    return {
+        "status": "healthy" if health.get("status") == "healthy" else "degraded",
+        "vision_model": "llama3.2-vision:11b",
+        "vision_available": vision_available,
+        "fallback_ocr": ["EasyOCR", "Tesseract --psm 6"]
+    }
 
 # --- Dashboard Progress Endpoint ---
 
@@ -254,6 +270,125 @@ async def submit_exam_paper_endpoint(
 # --- Document Endpoints ---
 
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50MB
+MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB
+MAX_IMAGE_BATCH_COUNT = 10
+
+ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/heic", "image/webp"]
+
+@app.post("/api/documents/upload-image", response_model=ImageNotesUploadResponse)
+async def upload_image_notes_endpoint(
+    files: List[UploadFile] = File(...),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Uploads 1 to 10 handwritten note images (JPEG, PNG, HEIC, WebP).
+    Uploads images to Supabase Storage, creates document record with status='processing',
+    and triggers background Celery task `process_image_notes_task`.
+    """
+    user_id = user["user_id"]
+    if not files:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No image files provided.")
+
+    if len(files) > MAX_IMAGE_BATCH_COUNT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum {MAX_IMAGE_BATCH_COUNT} images allowed per request ({len(files)} provided)."
+        )
+
+    saved_image_paths = []
+    storage_urls = []
+    upload_dir = f"/tmp/focusly_uploads/{user_id}"
+    os.makedirs(upload_dir, exist_ok=True)
+
+    for file in files:
+        fname = file.filename or "note.jpg"
+        ext = os.path.splitext(fname)[1].lower()
+        if file.content_type not in ALLOWED_IMAGE_TYPES and ext not in [".jpg", ".jpeg", ".png", ".heic", ".webp"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported image format '{fname}'. Allowed types: JPEG, PNG, HEIC, WebP."
+            )
+
+        content = await file.read()
+        if len(content) > MAX_IMAGE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Image file '{fname}' exceeds maximum allowed limit of 20MB ({len(content)} bytes)."
+            )
+
+        local_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}_{fname}")
+        with open(local_path, "wb") as f:
+            f.write(content)
+
+        storage_url = await document_service.upload_file_to_storage(content, fname, user_id)
+        storage_urls.append(storage_url)
+        saved_image_paths.append(local_path)
+
+    batch_filename = files[0].filename or "Handwritten_Notes.jpg"
+    if len(files) > 1:
+        batch_filename = f"Handwritten_Notes_{len(files)}_Pages.jpg"
+
+    doc_record = await document_service.create_document_record(
+        user_id, batch_filename, file_url=storage_urls[0] if storage_urls else None, source_type="image_notes", page_count=len(files)
+    )
+    doc_id = doc_record["id"]
+
+    await document_service.update_document(doc_id, {"original_images": storage_urls, "status": DocumentStatus.PROCESSING})
+
+    # Trigger background Celery task
+    try:
+        from workers.tasks import process_image_notes_task
+        process_image_notes_task.delay(doc_id, saved_image_paths)
+    except Exception:
+        # Fallback inline processing for local test environment
+        process_res = await document_service.process_image_notes_batch(doc_id, saved_image_paths)
+        return ImageNotesUploadResponse(
+            id=doc_id,
+            filename=batch_filename,
+            status=process_res.get("status", DocumentStatus.COMPLETED),
+            source_type=SourceType.IMAGE_NOTES,
+            page_count=len(files),
+            virtual_page_map=process_res.get("virtual_page_map", []),
+            ocr_confidence=process_res.get("ocr_confidence", 0.0),
+            message="Some pages yielded low OCR confidence (<60%). Please review transcription before studying." if process_res.get("status") == DocumentStatus.LOW_CONFIDENCE else None
+        )
+
+    return ImageNotesUploadResponse(
+        id=doc_id,
+        filename=batch_filename,
+        status=DocumentStatus.PROCESSING,
+        source_type=SourceType.IMAGE_NOTES,
+        page_count=len(files),
+        virtual_page_map=[],
+        ocr_confidence=0.0,
+        message="Handwritten notes uploaded successfully and queued for AI OCR processing."
+    )
+
+@app.get("/api/documents/{document_id}/status")
+async def get_document_status_endpoint(
+    document_id: str,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Returns detailed document status including OCR confidence, virtual page map, progress, and error message."""
+    doc = await document_service.get_document(document_id, user["user_id"])
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    doc_status = doc.get("status", "processing")
+    progress = 100 if doc_status in ["completed", "video_ready", "low_confidence"] else 50 if doc_status == "processing" else 0
+    err_msg = doc.get("error_message") or ("Processing failed" if doc_status == "failed" else None)
+
+    return {
+        "id": doc.get("id"),
+        "filename": doc.get("filename"),
+        "status": doc_status,
+        "progress": progress,
+        "error_message": err_msg,
+        "source_type": doc.get("source_type", "pdf"),
+        "page_count": doc.get("page_count", 0),
+        "virtual_page_map": doc.get("virtual_page_map", []),
+        "extracted_text_preview": (doc.get("extracted_text") or "")[:300]
+    }
 
 @app.post("/api/documents/upload", response_model=Dict[str, Any])
 @app.post("/documents/upload", response_model=Dict[str, Any])

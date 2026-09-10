@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 from workers.celery_app import celery_app
 from services.document_service import document_service
 from services.summary_service import summary_service
@@ -8,6 +9,26 @@ from services.video_service import video_service
 from services.review_service import review_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
+
+@celery_app.task(name="workers.tasks.process_image_notes_task")
+def process_image_notes_task(doc_id: str, image_paths: List[str]):
+    """
+    Background worker task to process handwritten image notes through the 3-tier OCR pipeline,
+    build virtual page map, assign virtual page numbers, extract diagrams, update document record,
+    and trigger summary generation.
+    """
+    try:
+        res = asyncio.run(document_service.process_image_notes_batch(doc_id, image_paths))
+        return {
+            "status": "success",
+            "doc_id": doc_id,
+            "page_count": len(image_paths),
+            "ocr_confidence": res.get("ocr_confidence", 0.0),
+            "doc_status": res.get("status")
+        }
+    except Exception as e:
+        asyncio.run(document_service.update_document(doc_id, {"status": "failed"}))
+        return {"status": "error", "message": str(e)}
 
 @celery_app.task(name="workers.tasks.process_document_task")
 def process_document_task(doc_id: str, file_path: str):

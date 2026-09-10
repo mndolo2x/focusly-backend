@@ -16,4 +16,9 @@ ffmpeg-python
 faiss-cpu
 pytest
 httpx
+opencv-python
+easyocr
+transformers
+torch
+pillow-heif
 PyJWT

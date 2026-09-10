@@ -25,7 +25,7 @@ class DocumentService:
             return storage_path
 
     async def create_document_record(
-        self, user_id: str, filename: str, file_url: Optional[str] = None, page_count: int = 0
+        self, user_id: str, filename: str, file_url: Optional[str] = None, page_count: int = 0, source_type: str = "pdf"
     ) -> Dict[str, Any]:
         """Creates a document database entry with status 'processing'."""
         doc_id = str(uuid.uuid4())
@@ -37,6 +37,9 @@ class DocumentService:
             "extracted_text": "",
             "status": DocumentStatus.PROCESSING,
             "page_count": page_count,
+            "source_type": source_type,
+            "original_images": [],
+            "virtual_page_map": [],
         }
         _in_memory_docs[doc_id] = record
         try:
@@ -91,6 +94,81 @@ class DocumentService:
             pass
 
         return {**doc, "summary": summary}
+
+    async def process_image_notes_batch(
+        self, doc_id: str, image_paths: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Processes a batch of uploaded image notes:
+        1. Preprocesses and transcribes each image with HandwritingOCR.
+        2. Assigns virtual page numbers (1..N).
+        3. Builds virtual_page_map with metadata, diagrams, and confidence scores.
+        4. Calculates aggregate confidence.
+        5. Updates document status ('completed' or 'low_confidence').
+        6. Triggers summary generation.
+        """
+        from utils.handwriting_ocr import handwriting_ocr
+        from utils.rag_engine import rag_engine
+        from services.summary_service import summary_service
+
+        virtual_page_map = []
+        combined_text_blocks = []
+        total_confidence = 0.0
+        low_confidence_pages = []
+
+        for idx, img_path in enumerate(image_paths, start=1):
+            res = await handwriting_ocr.transcribe_handwritten_image(img_path, page_num=idx)
+            page_text = res["text"]
+            conf = res["confidence"]
+            diagrams = res["diagrams"]
+            is_blurry = res["is_blurry"]
+
+            total_confidence += conf
+            if res["is_low_confidence"]:
+                low_confidence_pages.append(idx)
+
+            virtual_page_map.append({
+                "virtual_page": idx,
+                "image_path": img_path,
+                "ocr_confidence": conf,
+                "ocr_tier": res["ocr_tier"],
+                "diagrams_extracted": diagrams,
+                "is_blurry": is_blurry,
+                "low_confidence_warning": res["is_low_confidence"]
+            })
+
+            combined_text_blocks.append(page_text)
+
+        final_extracted_text = "\n\n".join(combined_text_blocks)
+        page_count = len(image_paths)
+        avg_confidence = round(total_confidence / page_count, 2) if page_count > 0 else 0.0
+
+        final_status = DocumentStatus.LOW_CONFIDENCE if (avg_confidence < 0.60 or len(low_confidence_pages) > 0) else DocumentStatus.COMPLETED
+
+        updates = {
+            "extracted_text": final_extracted_text,
+            "page_count": page_count,
+            "status": final_status,
+            "source_type": "image_notes",
+            "original_images": image_paths,
+            "virtual_page_map": virtual_page_map,
+        }
+
+        updated_doc = await self.update_document(doc_id, updates)
+
+        # Index text and trigger summary generation
+        try:
+            await rag_engine.index_document_chunks(doc_id, final_extracted_text)
+            from workers.tasks import summarize_document_task
+            summarize_document_task.delay(doc_id, depth="standard")
+        except Exception:
+            await summary_service.generate_summary_for_text(doc_id, final_extracted_text, depth="standard")
+
+        return {
+            **updated_doc,
+            "ocr_confidence": avg_confidence,
+            "low_confidence_pages": low_confidence_pages
+        }
 
     async def merge_documents(
         self, user_id: str, document_ids: List[str], merged_filename: Optional[str] = "Merged_Document.pdf"
