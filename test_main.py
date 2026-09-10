@@ -1,0 +1,444 @@
+import os
+import io
+import jwt
+import pytest
+from datetime import datetime, timedelta
+from fastapi.testclient import TestClient
+from main import app
+from services.gemini_service import gemini_service
+
+client = TestClient(app)
+
+def get_auth_headers(is_admin: bool = False):
+    token = jwt.encode(
+        {"sub": "user_123", "email": "test@focusly.ai", "user_metadata": {"is_admin": is_admin, "grade_level": "11th"}},
+        "test_secret",
+        algorithm="HS256"
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+def test_root():
+    response = client.get("/")
+    assert response.status_code == 200
+
+def test_timed_exam_mode_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file = io.BytesIO(fake_pdf)
+
+    # 1. Upload Document
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("physics.pdf", pdf_file, "application/pdf")},
+        headers=get_auth_headers()
+    )
+    assert up_res.status_code == 200
+    doc_id = up_res.json()["id"]
+
+    # 2. Start Timed Exam (35 questions)
+    start_res = client.post(
+        "/api/exam-mode/start",
+        json={"subject": "Physics Mechanics", "document_ids": [doc_id], "num_questions": 35},
+        headers=get_auth_headers()
+    )
+    assert start_res.status_code == 200
+    exam_session = start_res.json()
+    assert "id" in exam_session
+    assert exam_session["total_questions"] == 35
+    assert exam_session["duration_seconds"] == 4200 # 35 * 120s (~2 mins/question)
+    exam_id = exam_session["id"]
+
+    # 3. Check Status
+    status_res = client.get("/api/exam-mode/status", headers=get_auth_headers())
+    assert status_res.status_code == 200
+    s_data = status_res.json()
+    assert s_data["time_remaining_seconds"] > 0
+    assert s_data["paused"] is False
+
+    # 4. Pause Timer
+    pause_res = client.post("/api/exam-mode/pause", json={"exam_id": exam_id}, headers=get_auth_headers())
+    assert pause_res.status_code == 200
+    assert pause_res.json()["paused"] is True
+
+    # Check status during pause
+    status_paused = client.get("/api/exam-mode/status", headers=get_auth_headers())
+    assert status_paused.json()["paused"] is True
+
+    # 5. Resume Timer
+    resume_res = client.post("/api/exam-mode/resume", json={"exam_id": exam_id}, headers=get_auth_headers())
+    assert resume_res.status_code == 200
+    assert resume_res.json()["paused"] is False
+
+    # 6. Submit Timed Exam & Grade
+    q_id = exam_session["questions"][0]["id"]
+    submit_payload = {
+        "exam_id": exam_id,
+        "answers": [
+            {"question_id": q_id, "selected_answer": 0, "confidence_score": 5}
+        ]
+    }
+    submit_res = client.post("/api/exam-mode/submit", json=submit_payload, headers=get_auth_headers())
+    assert submit_res.status_code == 200
+    grade_data = submit_res.json()
+    assert "score" in grade_data
+    assert "feedback" in grade_data
+    assert grade_data["total_questions"] == 35
+
+def test_monitoring_and_health_endpoints(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    async def mock_gemini_health():
+        return {"status": "online", "provider": "google_gemini"}
+
+    async def mock_tts_health():
+        return {"status": "online", "engine": "Kokoro TTS"}
+
+    monkeypatch.setattr("services.gemini_service.gemini_service.check_health", mock_gemini_health)
+    monkeypatch.setattr("services.tts_service.tts_service.check_health", mock_tts_health)
+
+    # 1. Comprehensive Health Check
+    health_res = client.get("/api/health")
+    assert health_res.status_code == 200
+    h_data = health_res.json()
+    assert h_data["status"] == "ok"
+    assert "services" in h_data
+    assert h_data["services"]["gemini"] == "online"
+    assert h_data["services"]["supabase"] == "online"
+    assert h_data["services"]["redis"] == "online"
+    assert h_data["services"]["kokoro"] == "online"
+    assert h_data["services"]["ffmpeg"] == "online"
+
+    # 2. Celery Task Status Endpoint
+    task_res = client.get("/api/tasks/task_test_123/status", headers=get_auth_headers())
+    assert task_res.status_code == 200
+    t_data = task_res.json()
+    assert t_data["task_id"] == "task_test_123"
+    assert "status" in t_data
+    assert "progress_percent" in t_data
+
+    # 3. Global Exception Handler
+    bad_req_res = client.get("/api/documents/non_existent_doc_id_999", headers=get_auth_headers())
+    assert bad_req_res.status_code == 404
+    err_data = bad_req_res.json()
+    assert err_data["status_code"] == 404
+    assert err_data["error"] == "Document not found"
+    assert "timestamp" in err_data
+    assert err_data["path"] == "/api/documents/non_existent_doc_id_999"
+
+def test_admin_comprehensive_endpoints_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # 1. List users
+    users_res = client.get("/api/admin/users", headers=get_auth_headers(is_admin=True))
+    assert users_res.status_code == 200
+    assert "users" in users_res.json()
+
+    # 2. Get user details
+    detail_res = client.get("/api/admin/users/user_123", headers=get_auth_headers(is_admin=True))
+    assert detail_res.status_code == 200
+    assert detail_res.json()["id"] == "user_123"
+
+    # 3. Toggle status
+    status_res = client.put(
+        "/api/admin/users/user_123/status",
+        json={"status": "suspended", "reason": "Terms of service violation"},
+        headers=get_auth_headers(is_admin=True)
+    )
+    assert status_res.status_code == 200
+    assert status_res.json()["account_status"] == "suspended"
+
+    # 4. Aggregate usage stats
+    usage_res = client.get("/api/admin/usage", headers=get_auth_headers(is_admin=True))
+    assert usage_res.status_code == 200
+    assert "aggregate" in usage_res.json()
+
+    # 5. List documents with filter
+    docs_res = client.get("/api/admin/documents?status_filter=completed", headers=get_auth_headers(is_admin=True))
+    assert docs_res.status_code == 200
+    assert "documents" in docs_res.json()
+
+    # 6. Admin delete document
+    del_res = client.delete("/api/admin/documents/doc_admin_999", headers=get_auth_headers(is_admin=True))
+    assert del_res.status_code == 200
+    assert "deleted by admin override" in del_res.json()["message"]
+
+    # 7. System logs
+    logs_res = client.get("/api/admin/logs", headers=get_auth_headers(is_admin=True))
+    assert logs_res.status_code == 200
+    assert "logs" in logs_res.json()
+
+    # 8. Maintenance cleanup
+    cleanup_res = client.post("/api/admin/maintenance/cleanup", headers=get_auth_headers(is_admin=True))
+    assert cleanup_res.status_code == 200
+    assert "Maintenance cleanup completed successfully" in cleanup_res.json()["message"]
+
+    # 9. Non-admin forbidden check
+    forbidden_res = client.get("/api/admin/users", headers=get_auth_headers(is_admin=False))
+    assert forbidden_res.status_code == 403
+
+def test_user_usage_and_quota_enforcement(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # 1. Get user usage
+    res = client.get("/api/user/usage", headers=get_auth_headers())
+    assert res.status_code == 200
+    data = res.json()
+    assert "user_id" in data
+    assert data["video_generations_limit"] == 10
+    assert data["summary_generations_limit"] == 50
+    assert "next_reset_date" in data
+    assert "X-AI-Disclaimer" in res.headers
+
+    # 2. Check 429 quota enforcement for summary when over limit
+    async def mock_over_quota_summary(user_id):
+        return False
+
+    monkeypatch.setattr("services.summary_service.summary_service.check_user_summary_quota", mock_over_quota_summary)
+
+    # Upload document first
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("quota_test.pdf", io.BytesIO(fake_pdf), "application/pdf")},
+        headers=get_auth_headers()
+    )
+    doc_id = up_res.json()["id"]
+
+    sum_res = client.post(
+        f"/api/documents/{doc_id}/summarize",
+        headers=get_auth_headers()
+    )
+    assert sum_res.status_code == 429
+    assert "quota exceeded" in sum_res.json()["detail"].lower()
+
+    # 3. Admin usage adjustment
+    admin_res = client.put(
+        "/api/admin/users/user_123/usage",
+        json={"summary_generations_used": 0, "video_generations_used": 0},
+        headers=get_auth_headers(is_admin=True)
+    )
+    assert admin_res.status_code == 200
+    assert "adjusted successfully" in admin_res.json()["message"]
+
+def test_public_share_links_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # 1. Upload Document
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("biology_notes.pdf", io.BytesIO(fake_pdf), "application/pdf")},
+        headers=get_auth_headers()
+    )
+    assert up_res.status_code == 200
+    doc_id = up_res.json()["id"]
+
+    # Mock summary and quiz questions
+    async def mock_summary(document_id):
+        return {
+            "id": "sum_1",
+            "document_id": document_id,
+            "sections": [
+                {"title": "Cell Biology", "content": "Cells are the basic unit of life.", "bullets": ["Prokaryotes", "Eukaryotes"]}
+            ]
+        }
+
+    async def mock_questions(document_id):
+        return [
+            {
+                "id": "q1",
+                "document_id": document_id,
+                "section_index": 0,
+                "question_text": "What is the powerhouse of the cell?",
+                "options": ["Mitochondria", "Nucleus", "Ribosome", "Golgi"],
+                "correct_answer_index": 0
+            }
+        ]
+
+    monkeypatch.setattr("services.summary_service.summary_service.get_latest_summary", mock_summary)
+    monkeypatch.setattr("services.quiz_service.quiz_service.get_quiz_questions", mock_questions)
+
+    # 2. Create Share Link (Authenticated)
+    share_res = client.post(
+        f"/api/documents/{doc_id}/share",
+        json={"expires_in_days": 7},
+        headers=get_auth_headers()
+    )
+    assert share_res.status_code == 200
+    share_data = share_res.json()
+    assert "share_id" in share_data
+    share_id = share_data["share_id"]
+
+    # 3. Get Public Shared Content (Unauthenticated)
+    pub_res = client.get(f"/api/public/{share_id}")
+    assert pub_res.status_code == 200
+    pub_data = pub_res.json()
+
+    assert pub_data["title"] == "biology_notes.pdf"
+    assert len(pub_data["summary_sections"]) == 1
+    assert pub_data["summary_sections"][0]["title"] == "Cell Biology"
+    assert len(pub_data["quiz_questions"]) == 1
+    q1 = pub_data["quiz_questions"][0]
+    assert q1["question_text"] == "What is the powerhouse of the cell?"
+    # EXCLUSION CHECKS: No video_url, no full extracted_text, no user_id, no correct_answer_index in public questions
+    assert "video_url" not in pub_data
+    assert "extracted_text" not in pub_data
+    assert "user_id" not in pub_data
+    assert "correct_answer_index" not in q1
+    assert "disclaimer" in pub_data
+
+    # 4. Anonymous Quiz Submit (Unauthenticated)
+    sub_res = client.post(
+        f"/api/public/{share_id}/quiz/submit",
+        json={
+            "submissions": [
+                {"question_id": "q1", "selected_answer": 0}
+            ]
+        }
+    )
+    assert sub_res.status_code == 200
+    sub_data = sub_res.json()
+    assert sub_data["score_percent"] == 100.0
+    assert sub_data["correct_count"] == 1
+    assert sub_data["total_questions"] == 1
+    assert "disclaimer" in sub_data
+
+def test_vision_health_check(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    async def mock_gemini_health():
+        return {"status": "online", "provider": "google_gemini"}
+
+    monkeypatch.setattr("services.gemini_service.gemini_service.check_health", mock_gemini_health)
+
+    res = client.get("/api/health/vision")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "healthy"
+    assert data["vision_available"] is True
+    assert "gemini" in data["vision_model"]
+
+def test_ask_focusly_endpoint_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    async def mock_ask(question, context_text=None, student_history=None):
+        return {
+            "question": question,
+            "answer": "Mitosis is the process of cell division.",
+            "grounded_in_context": True,
+            "timestamp": 1234567890
+        }
+
+    monkeypatch.setattr("services.gemini_service.gemini_service.ask_focusly", mock_ask)
+
+    res = client.post(
+        "/api/study/ask",
+        json={"question": "Explain mitosis simply", "document_id": "doc_123"},
+        headers=get_auth_headers()
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["question"] == "Explain mitosis simply"
+    assert "Mitosis" in data["answer"]
+
+def test_image_notes_upload_and_status_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (200, 200), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((10, 10), "Handwritten note content", fill=(0, 0, 0))
+
+    img_bytes_io = io.BytesIO()
+    img.save(img_bytes_io, format="JPEG")
+    img_bytes = img_bytes_io.getvalue()
+
+    # Mock OCR response
+    async def mock_transcribe(image_input, page_num=1):
+        return {
+            "virtual_page": page_num,
+            "text": f"--- Virtual Page {page_num} ---\nPhysics formulas\n[DIAGRAM: Circuit diagram with resistor and battery]",
+            "raw_text": "Physics formulas\n[DIAGRAM: Circuit diagram with resistor and battery]",
+            "confidence": 0.88,
+            "ocr_tier": "llama3.2-vision",
+            "diagrams": ["Circuit diagram with resistor and battery"],
+            "is_blurry": False,
+            "is_low_confidence": False,
+            "blur_score": 150.0
+        }
+
+    monkeypatch.setattr("utils.handwriting_ocr.handwriting_ocr.transcribe_handwritten_image", mock_transcribe)
+
+    upload_res = client.post(
+        "/api/documents/upload-image",
+        files=[
+            ("files", ("page1.jpg", io.BytesIO(img_bytes), "image/jpeg")),
+            ("files", ("page2.jpg", io.BytesIO(img_bytes), "image/jpeg"))
+        ],
+        headers=get_auth_headers()
+    )
+
+    assert upload_res.status_code == 200
+    res_data = upload_res.json()
+    assert "id" in res_data
+    doc_id = res_data["id"]
+    assert res_data["source_type"] == "image_notes"
+    assert res_data["page_count"] == 2
+    assert res_data["ocr_confidence"] == 0.88
+    assert len(res_data["virtual_page_map"]) == 2
+    assert res_data["virtual_page_map"][0]["virtual_page"] == 1
+    assert "Circuit diagram" in res_data["virtual_page_map"][0]["diagrams_extracted"][0]
+
+    # Check status endpoint
+    status_res = client.get(f"/api/documents/{doc_id}/status", headers=get_auth_headers())
+    assert status_res.status_code == 200
+    st_data = status_res.json()
+    assert st_data["id"] == doc_id
+    assert st_data["source_type"] == "image_notes"
+    assert st_data["page_count"] == 2
+    assert len(st_data["virtual_page_map"]) == 2
+
+def test_image_notes_low_confidence_flagging(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), color=(100, 100, 100))
+    img_bytes_io = io.BytesIO()
+    img.save(img_bytes_io, format="JPEG")
+    img_bytes = img_bytes_io.getvalue()
+
+    # Mock low confidence OCR result
+    async def mock_low_conf_transcribe(image_input, page_num=1):
+        return {
+            "virtual_page": page_num,
+            "text": f"--- Virtual Page {page_num} ---\nunreadable scribble",
+            "raw_text": "unreadable scribble",
+            "confidence": 0.35,
+            "ocr_tier": "tesseract",
+            "diagrams": [],
+            "is_blurry": True,
+            "is_low_confidence": True,
+            "blur_score": 40.0
+        }
+
+    monkeypatch.setattr("utils.handwriting_ocr.handwriting_ocr.transcribe_handwritten_image", mock_low_conf_transcribe)
+
+    upload_res = client.post(
+        "/api/documents/upload-image",
+        files=[("files", ("blurry.jpg", io.BytesIO(img_bytes), "image/jpeg"))],
+        headers=get_auth_headers()
+    )
+
+    assert upload_res.status_code == 200
+    res_data = upload_res.json()
+    assert res_data["status"] == "low_confidence"
+    assert res_data["ocr_confidence"] == 0.35
+    assert "low OCR confidence" in res_data["message"]
+
+@pytest.mark.anyio
+async def test_gemini_service_generate_retry_error_handling(monkeypatch):
+    monkeypatch.setattr("services.gemini_service.gemini_service.api_key", "invalid_key")
+    with pytest.raises(RuntimeError) as exc_info:
+        await gemini_service.generate_text("Test prompt", max_retries=2, retry_delay=0.01)
+    assert "Focusly couldn't process" in str(exc_info.value) or "Gemini" in str(exc_info.value)
