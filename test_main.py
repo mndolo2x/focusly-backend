@@ -85,6 +85,89 @@ def test_timed_exam_mode_flow(monkeypatch):
     assert "feedback" in grade_data
     assert grade_data["total_questions"] == 35
 
+def test_public_share_links_flow(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    # 1. Upload Document
+    fake_pdf = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    up_res = client.post(
+        "/api/documents/upload",
+        files={"file": ("biology_notes.pdf", io.BytesIO(fake_pdf), "application/pdf")},
+        headers=get_auth_headers()
+    )
+    assert up_res.status_code == 200
+    doc_id = up_res.json()["id"]
+
+    # Mock summary and quiz questions
+    async def mock_summary(document_id):
+        return {
+            "id": "sum_1",
+            "document_id": document_id,
+            "sections": [
+                {"title": "Cell Biology", "content": "Cells are the basic unit of life.", "bullets": ["Prokaryotes", "Eukaryotes"]}
+            ]
+        }
+
+    async def mock_questions(document_id):
+        return [
+            {
+                "id": "q1",
+                "document_id": document_id,
+                "section_index": 0,
+                "question_text": "What is the powerhouse of the cell?",
+                "options": ["Mitochondria", "Nucleus", "Ribosome", "Golgi"],
+                "correct_answer_index": 0
+            }
+        ]
+
+    monkeypatch.setattr("services.summary_service.summary_service.get_latest_summary", mock_summary)
+    monkeypatch.setattr("services.quiz_service.quiz_service.get_quiz_questions", mock_questions)
+
+    # 2. Create Share Link (Authenticated)
+    share_res = client.post(
+        f"/api/documents/{doc_id}/share",
+        json={"expires_in_days": 7},
+        headers=get_auth_headers()
+    )
+    assert share_res.status_code == 200
+    share_data = share_res.json()
+    assert "share_id" in share_data
+    share_id = share_data["share_id"]
+
+    # 3. Get Public Shared Content (Unauthenticated)
+    pub_res = client.get(f"/api/public/{share_id}")
+    assert pub_res.status_code == 200
+    pub_data = pub_res.json()
+
+    assert pub_data["title"] == "biology_notes.pdf"
+    assert len(pub_data["summary_sections"]) == 1
+    assert pub_data["summary_sections"][0]["title"] == "Cell Biology"
+    assert len(pub_data["quiz_questions"]) == 1
+    q1 = pub_data["quiz_questions"][0]
+    assert q1["question_text"] == "What is the powerhouse of the cell?"
+    # EXCLUSION CHECKS: No video_url, no full extracted_text, no user_id, no correct_answer_index in public questions
+    assert "video_url" not in pub_data
+    assert "extracted_text" not in pub_data
+    assert "user_id" not in pub_data
+    assert "correct_answer_index" not in q1
+    assert "disclaimer" in pub_data
+
+    # 4. Anonymous Quiz Submit (Unauthenticated)
+    sub_res = client.post(
+        f"/api/public/{share_id}/quiz/submit",
+        json={
+            "submissions": [
+                {"question_id": "q1", "selected_answer": 0}
+            ]
+        }
+    )
+    assert sub_res.status_code == 200
+    sub_data = sub_res.json()
+    assert sub_data["score_percent"] == 100.0
+    assert sub_data["correct_count"] == 1
+    assert sub_data["total_questions"] == 1
+    assert "disclaimer" in sub_data
+
 def test_vision_health_check(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 

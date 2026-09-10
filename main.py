@@ -20,6 +20,9 @@ from models import (
     StudyPlanResponse,
     SharedLinkCreate,
     SharedLinkResponse,
+    PublicShareResponse,
+    PublicQuizSubmitRequest,
+    PublicQuizSubmitResponse,
     AIContentDisclaimer,
     ExamPaperGenerateRequest,
     ExamPaperSubmission,
@@ -497,6 +500,61 @@ async def delete_document(document_id: str, user: Dict[str, Any] = Depends(get_c
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     return {"message": "Document and associated storage file deleted successfully", "id": document_id}
+
+# --- Share Link Endpoints ---
+
+@app.post("/api/documents/{document_id}/share", response_model=SharedLinkResponse)
+async def create_share_link_endpoint(
+    document_id: str,
+    payload: Optional[SharedLinkCreate] = SharedLinkCreate(document_id=""),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Generates a unique share_id for a document with 7 days expiration.
+    Returns SharedLinkResponse with share_id and expires_at.
+    """
+    expires_in_days = payload.expires_in_days if (payload and payload.expires_in_days) else 7
+    try:
+        link_record = await document_service.create_share_link(
+            user["user_id"], document_id, expires_in_days=expires_in_days
+        )
+        return link_record
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+@app.get("/api/public/{share_id}", response_model=PublicShareResponse)
+async def get_public_share_endpoint(share_id: str):
+    """
+    Public unauthenticated endpoint returning:
+    - Document title
+    - Summary sections and bullet points
+    - Quiz questions (WITHOUT answers)
+    - EXCLUDES: Video URL, full extracted text, user metadata
+    - Includes AI content disclaimer
+    """
+    content = await document_service.get_public_shared_content(share_id)
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shared link not found or has expired."
+        )
+    return content
+
+@app.post("/api/public/{share_id}/quiz/submit", response_model=PublicQuizSubmitResponse)
+async def submit_public_quiz_endpoint(share_id: str, payload: PublicQuizSubmitRequest):
+    """
+    Public unauthenticated endpoint for anonymous quiz taking.
+    Evaluates submitted answers against quiz questions without saving scores or tracking user history.
+    Includes AI content disclaimer.
+    """
+    submissions = [s.model_dump() for s in payload.submissions] if payload.submissions else []
+    result = await document_service.evaluate_public_quiz(share_id, submissions)
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shared link not found or has expired."
+        )
+    return result
 
 # --- Summary Endpoints ---
 
