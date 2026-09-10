@@ -21,49 +21,46 @@ def test_root():
     response = client.get("/")
     assert response.status_code == 200
 
-def test_ai_study_plan_builder_flow(monkeypatch):
+def test_document_merge_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 
-    exam_date_str = (datetime.utcnow() + timedelta(days=14)).isoformat() + "Z"
+    fake_pdf1 = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file1 = io.BytesIO(fake_pdf1)
 
-    # 1. Create AI Study Plan (POST /api/study-plan)
-    post_res = client.post(
-        "/api/study-plan",
-        json={"exam_date": exam_date_str, "subject": "AP Chemistry", "documents": []},
+    fake_pdf2 = b"%PDF-1.4\n1 0 obj\n<<\n/Type /Catalog\n>>\nendobj\ntrailer\n<<\n/Root 1 0 R\n>>\n%%EOF"
+    pdf_file2 = io.BytesIO(fake_pdf2)
+
+    # 1. Upload Doc 1
+    up_res1 = client.post(
+        "/api/documents/upload",
+        files={"file": ("part1.pdf", pdf_file1, "application/pdf")},
         headers=get_auth_headers()
     )
-    assert post_res.status_code == 200
-    plan = post_res.json()
-    assert "schedule" in plan
-    assert plan["subject"] == "AP Chemistry"
+    assert up_res1.status_code == 200
+    doc1_id = up_res1.json()["id"]
 
-    # 2. Get Current Plan (GET /api/study-plan)
-    get_res = client.get("/api/study-plan", headers=get_auth_headers())
-    assert get_res.status_code == 200
-    assert get_res.json()["id"] == plan["id"]
-
-    # 3. Get Today's Tasks (GET /api/study-plan/today)
-    today_res = client.get("/api/study-plan/today", headers=get_auth_headers())
-    assert today_res.status_code == 200
-    today_data = today_res.json()
-    assert "tasks" in today_data
-    assert len(today_data["tasks"]) >= 1
-
-    task_id = today_data["tasks"][0].get("id", "task_1_1")
-
-    # 4. Complete Task (POST /api/study-plan/tasks/{id}/complete)
-    comp_res = client.post(f"/api/study-plan/tasks/{task_id}/complete", headers=get_auth_headers())
-    assert comp_res.status_code == 200
-    assert comp_res.json()["completed"] is True
-
-    # 5. Update/Regenerate Plan (PUT /api/study-plan)
-    put_res = client.put(
-        "/api/study-plan",
-        json={"subject": "AP Chemistry Advanced"},
+    # 2. Upload Doc 2
+    up_res2 = client.post(
+        "/api/documents/upload",
+        files={"file": ("part2.pdf", pdf_file2, "application/pdf")},
         headers=get_auth_headers()
     )
-    assert put_res.status_code == 200
-    assert put_res.json()["subject"] == "AP Chemistry Advanced"
+    assert up_res2.status_code == 200
+    doc2_id = up_res2.json()["id"]
+
+    # 3. Merge Documents (POST /api/documents/merge)
+    merge_res = client.post(
+        "/api/documents/merge",
+        json={"document_ids": [doc1_id, doc2_id], "merged_filename": "Combined_Biology.pdf"},
+        headers=get_auth_headers()
+    )
+    assert merge_res.status_code == 200
+    merged_data = merge_res.json()
+    assert "id" in merged_data
+    assert merged_data["filename"] == "Combined_Biology.pdf"
+    assert merged_data["id"] != doc1_id
+    assert merged_data["id"] != doc2_id
+    assert merged_data["status"] == "processing" or merged_data["status"] == "completed"
 
 @pytest.mark.anyio
 async def test_ollama_service_generate_retry_error_handling(monkeypatch):

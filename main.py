@@ -25,6 +25,7 @@ from models import (
     EXAM_PAPER_DISCLAIMER,
     StudyPlanCreateAI,
     StudyPlanUpdateAI,
+    DocumentMergeRequest,
 )
 from services.document_service import document_service
 from services.summary_service import summary_service
@@ -257,6 +258,28 @@ async def upload_document(
         )
 
     return doc_record
+
+@app.post("/api/documents/merge", response_model=Dict[str, Any])
+async def merge_documents_endpoint(
+    payload: DocumentMergeRequest,
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Merges multiple user documents:
+    1. Validates ownership of all documents.
+    2. Combines extracted text preserving offset page numbers.
+    3. Creates new document entry with status='processing'.
+    4. Triggers background summary generation.
+    """
+    try:
+        merged_doc = await document_service.merge_documents(
+            user["user_id"], payload.document_ids, payload.merged_filename
+        )
+        return merged_doc
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Merge failed: {str(e)}")
 
 @app.get("/api/documents", response_model=Dict[str, Any])
 @app.get("/documents", response_model=Dict[str, Any])

@@ -37,6 +37,12 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user: UserProfileResponse
 
+# --- DOCUMENT MERGE MODELS ---
+
+class DocumentMergeRequest(BaseModel):
+    document_ids: List[str]
+    merged_filename: Optional[str] = "Merged_Document.pdf"
+
 # --- ADMIN EXAM MODELS ---
 
 class ExamResearchRequest(BaseModel):

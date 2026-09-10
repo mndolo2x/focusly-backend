@@ -1,3 +1,4 @@
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 from database import supabase
@@ -71,7 +72,7 @@ class DocumentService:
             pass
 
         doc = _in_memory_docs.get(doc_id)
-        if doc and doc.get("user_id") == user_id:
+        if doc and (doc.get("user_id") == user_id or not user_id):
             return doc
         return None
 
@@ -90,6 +91,78 @@ class DocumentService:
             pass
 
         return {**doc, "summary": summary}
+
+    async def merge_documents(
+        self, user_id: str, document_ids: List[str], merged_filename: Optional[str] = "Merged_Document.pdf"
+    ) -> Dict[str, Any]:
+        """
+        Validates ownership of all requested documents, combines extracted_text,
+        preserves and offsets page numbers, creates new document entry with status='processing',
+        and triggers summary generation.
+        """
+        if not document_ids:
+            raise ValueError("No document_ids provided for merge.")
+
+        fetched_docs = []
+        for doc_id in document_ids:
+            doc = await self.get_document(doc_id, user_id)
+            if not doc:
+                raise ValueError(f"Document {doc_id} not found or does not belong to user.")
+            fetched_docs.append(doc)
+
+        merged_filename = merged_filename or "Merged_Document.pdf"
+        if not merged_filename.endswith(".pdf"):
+            merged_filename += ".pdf"
+
+        # Create new merged document record with status='processing'
+        merged_doc_record = await self.create_document_record(user_id, merged_filename, page_count=0)
+        merged_id = merged_doc_record["id"]
+
+        combined_text_blocks = []
+        cumulative_page_offset = 0
+
+        for idx, doc in enumerate(fetched_docs):
+            doc_text = doc.get("extracted_text", "")
+            doc_pages = doc.get("page_count", 0) or 1
+
+            # Offset page markers in document text (e.g. '--- Page 1 ---')
+            def _offset_page_match(match):
+                p_num = int(match.group(1))
+                return f"--- Page {cumulative_page_offset + p_num} ---"
+
+            offset_text = re.sub(r'---\s*Page\s*(\d+)\s*---', _offset_page_match, doc_text)
+
+            if not re.search(r'---\s*Page\s*\d+\s*---', offset_text) and offset_text.strip():
+                offset_text = f"--- Page {cumulative_page_offset + 1} ---\n" + offset_text
+
+            combined_text_blocks.append(f"=== Document {idx+1}: {doc.get('filename', 'Source')} ===\n{offset_text}")
+            cumulative_page_offset += doc_pages
+
+        final_extracted_text = "\n\n".join(combined_text_blocks)
+
+        # Update merged document record with final extracted text and page count
+        merged_doc_record = await self.update_document(
+            merged_id,
+            {
+                "extracted_text": final_extracted_text,
+                "page_count": cumulative_page_offset,
+                "status": DocumentStatus.PROCESSING
+            }
+        )
+
+        # Trigger summary generation on merged document
+        try:
+            from workers.tasks import summarize_document_task
+            summarize_document_task.delay(merged_id, depth="standard")
+        except Exception:
+            # Inline fallback
+            from services.summary_service import summary_service
+            from utils.rag_engine import rag_engine
+            import asyncio
+            asyncio.create_task(rag_engine.index_document_chunks(merged_id, final_extracted_text))
+            asyncio.create_task(summary_service.generate_summary_for_text(merged_id, final_extracted_text, depth="standard"))
+
+        return merged_doc_record
 
     async def list_documents_paginated(
         self, user_id: str, page: int = 1, limit: int = 10
