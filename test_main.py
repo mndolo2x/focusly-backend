@@ -85,6 +85,47 @@ def test_timed_exam_mode_flow(monkeypatch):
     assert "feedback" in grade_data
     assert grade_data["total_questions"] == 35
 
+def test_monitoring_and_health_endpoints(monkeypatch):
+    monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
+
+    async def mock_health():
+        return {"status": "online", "models": ["llama3.1:8b"]}
+
+    async def mock_tts_health():
+        return {"status": "online", "engine": "Kokoro TTS"}
+
+    monkeypatch.setattr("services.ollama_service.ollama_service.check_health", mock_health)
+    monkeypatch.setattr("services.tts_service.tts_service.check_health", mock_tts_health)
+
+    # 1. Comprehensive Health Check
+    health_res = client.get("/api/health")
+    assert health_res.status_code == 200
+    h_data = health_res.json()
+    assert h_data["status"] == "ok"
+    assert "services" in h_data
+    assert h_data["services"]["ollama"] == "online"
+    assert h_data["services"]["supabase"] == "online"
+    assert h_data["services"]["redis"] == "online"
+    assert h_data["services"]["kokoro"] == "online"
+    assert h_data["services"]["ffmpeg"] == "online"
+
+    # 2. Celery Task Status Endpoint
+    task_res = client.get("/api/tasks/task_test_123/status", headers=get_auth_headers())
+    assert task_res.status_code == 200
+    t_data = task_res.json()
+    assert t_data["task_id"] == "task_test_123"
+    assert "status" in t_data
+    assert "progress_percent" in t_data
+
+    # 3. Global Exception Handler
+    bad_req_res = client.get("/api/documents/non_existent_doc_id_999", headers=get_auth_headers())
+    assert bad_req_res.status_code == 404
+    err_data = bad_req_res.json()
+    assert err_data["status_code"] == 404
+    assert err_data["error"] == "Document not found"
+    assert "timestamp" in err_data
+    assert err_data["path"] == "/api/documents/non_existent_doc_id_999"
+
 def test_admin_comprehensive_endpoints_flow(monkeypatch):
     monkeypatch.setattr("config.settings.SUPABASE_JWT_SECRET", "test_secret")
 

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from workers.celery_app import celery_app
@@ -10,15 +11,28 @@ from services.review_service import review_service
 from utils.text_extractor import text_extractor
 from utils.rag_engine import rag_engine
 
-@celery_app.task(name="workers.tasks.process_image_notes_task")
+logger = logging.getLogger("focusly.tasks")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
+    logger.addHandler(ch)
+
+@celery_app.task(
+    name="workers.tasks.process_image_notes_task",
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3, "countdown": 5}
+)
 def process_image_notes_task(doc_id: str, image_paths: List[str]):
     """
-    Background worker task to process handwritten image notes through the 3-tier OCR pipeline,
-    build virtual page map, assign virtual page numbers, extract diagrams, update document record,
-    and trigger summary generation.
+    Background worker task with automatic retries and exponential backoff to process handwritten image notes.
     """
+    logger.info(f"Task Started -> process_image_notes_task for doc_id: {doc_id}, images: {len(image_paths)}")
     try:
         res = asyncio.run(document_service.process_image_notes_batch(doc_id, image_paths))
+        logger.info(f"Task Success -> process_image_notes_task for doc_id: {doc_id}")
         return {
             "status": "success",
             "doc_id": doc_id,
@@ -27,15 +41,22 @@ def process_image_notes_task(doc_id: str, image_paths: List[str]):
             "doc_status": res.get("status")
         }
     except Exception as e:
+        logger.error(f"Task Error -> process_image_notes_task failed for doc_id {doc_id}: {str(e)}")
         asyncio.run(document_service.update_document(doc_id, {"status": "failed"}))
-        return {"status": "error", "message": str(e)}
+        raise e
 
-@celery_app.task(name="workers.tasks.process_document_task")
+@celery_app.task(
+    name="workers.tasks.process_document_task",
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3, "countdown": 5}
+)
 def process_document_task(doc_id: str, file_path: str):
     """
-    Background worker task to extract text from document, update record status,
-    and index vector embeddings into RAG engine.
+    Background worker task with automatic retries to extract text from document and index into RAG engine.
     """
+    logger.info(f"Task Started -> process_document_task for doc_id: {doc_id}")
     try:
         extracted_text, page_count = text_extractor.extract_text_and_page_count(file_path)
 
@@ -48,18 +69,25 @@ def process_document_task(doc_id: str, file_path: str):
             }
         ))
         asyncio.run(rag_engine.index_document_chunks(doc_id, extracted_text))
+        logger.info(f"Task Success -> process_document_task for doc_id: {doc_id}, pages: {page_count}")
         return {"status": "success", "doc_id": doc_id, "page_count": page_count}
     except Exception as e:
+        logger.error(f"Task Error -> process_document_task failed for doc_id {doc_id}: {str(e)}")
         asyncio.run(document_service.update_document(doc_id, {"status": "failed"}))
-        return {"status": "error", "message": str(e)}
+        raise e
 
-@celery_app.task(name="workers.tasks.summarize_document_task")
+@celery_app.task(
+    name="workers.tasks.summarize_document_task",
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3, "countdown": 5}
+)
 def summarize_document_task(document_id: str, depth: str = "standard"):
     """
-    Celery task to chunk document text, generate embeddings using Ollama,
-    index vectors into FAISS, query Ollama for structured summary with page numbers,
-    store result in summaries table, and update document status.
+    Celery task with automatic retries to chunk text, index FAISS vectors, and generate structured summary.
     """
+    logger.info(f"Task Started -> summarize_document_task for document_id: {document_id}, depth: {depth}")
     try:
         doc = asyncio.run(document_service.get_document(document_id, user_id=""))
         if not doc:
@@ -69,6 +97,7 @@ def summarize_document_task(document_id: str, depth: str = "standard"):
                 doc = res.data[0]
 
         if not doc:
+            logger.error(f"Task Error -> summarize_document_task document {document_id} not found.")
             return {"status": "error", "message": f"Document {document_id} not found."}
 
         text = doc.get("extracted_text", "")
@@ -76,41 +105,52 @@ def summarize_document_task(document_id: str, depth: str = "standard"):
         summary_record = asyncio.run(summary_service.generate_summary_for_text(document_id, text, depth=depth))
         asyncio.run(document_service.update_document(document_id, {"status": "completed"}))
 
+        logger.info(f"Task Success -> summarize_document_task for document_id: {document_id}")
         return {"status": "success", "document_id": document_id, "summary_id": summary_record.get("id")}
     except Exception as e:
+        logger.error(f"Task Error -> summarize_document_task failed for document_id {document_id}: {str(e)}")
         asyncio.run(document_service.update_document(document_id, {"status": "failed"}))
-        return {"status": "error", "message": str(e)}
+        raise e
 
-@celery_app.task(name="workers.tasks.generate_quiz_task")
+@celery_app.task(
+    name="workers.tasks.generate_quiz_task",
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3, "countdown": 5}
+)
 def generate_quiz_task(document_id: str, num_questions: int = 10):
     """
-    Celery task to generate multiple-choice quiz questions from document summary sections using Ollama.
+    Celery task with automatic retries to generate quiz questions using Ollama.
     """
+    logger.info(f"Task Started -> generate_quiz_task for document_id: {document_id}, questions: {num_questions}")
     try:
         questions = asyncio.run(quiz_service.generate_quiz_from_summary(document_id, num_questions=num_questions))
+        logger.info(f"Task Success -> generate_quiz_task generated {len(questions)} questions")
         return {"status": "success", "document_id": document_id, "questions_generated": len(questions)}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Task Error -> generate_quiz_task failed for document_id {document_id}: {str(e)}")
+        raise e
 
 @celery_app.task(
     name="workers.tasks.generate_video_task",
     autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
     retry_kwargs={"max_retries": 3, "countdown": 5}
 )
 def generate_video_task(document_id: str):
     """
-    Celery task with 3 retries and exponential backoff to generate narrated MP4 video lesson:
-    1. Sets document status='processing'.
-    2. Calls Kokoro TTS for audio and Pillow for 1080p white slides with page numbers.
-    3. Assembles MP4 video using FFmpeg.
-    4. Uploads MP4 to Supabase Storage.
-    5. Updates document status='video_ready' and stores public video URL.
+    Celery task with 3 retries and exponential backoff to generate narrated MP4 video lesson.
     """
+    logger.info(f"Task Started -> generate_video_task for document_id: {document_id}")
     try:
         asyncio.run(document_service.update_document(document_id, {"status": "processing"}))
         video_url = asyncio.run(video_service.generate_video_lesson(document_id))
+        logger.info(f"Task Success -> generate_video_task for document_id: {document_id}")
         return {"status": "success", "document_id": document_id, "video_url": video_url}
     except Exception as e:
+        logger.error(f"Task Error -> generate_video_task failed for document_id {document_id}: {str(e)}")
         asyncio.run(document_service.update_document(document_id, {"status": "failed"}))
         raise e
 
